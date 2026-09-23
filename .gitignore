@@ -8,6 +8,9 @@ venv/
 
 # живые привязки владельца: личные пути, меняются из приложения
 midi_config.json
+midi_config.*.json
+presets/
+smc-pad-*.json
 
 # local-only: session handoff notes, history backups
 HANDOFF.md

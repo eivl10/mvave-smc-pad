@@ -118,8 +118,10 @@ def test_export_import_roundtrip():
         assert c["ble_address"] == "BB:BB:BB:BB:BB:BB", "импорт затёр адрес этой машины"
         assert "app" not in c and "exported_at" not in c
         assert "Z:/нет/такой.exe" in report and "knob_3" in report, report
-        baks = [f for f in os.listdir(d) if ".before-import-" in f]
+        baks = [f for f in os.listdir(appconfig.backups_dir()) if ".before-import-" in f]
         assert baks, "бэкап перед импортом не создан"
+        assert not [f for f in os.listdir(d) if ".before-import-" in f], \
+            "бэкап снова лёг рядом с конфигом, а не в presets/_backups"
         on_disk = json.load(open(appconfig.CONFIG_FILE, encoding="utf-8"))
         assert on_disk["bindings"]["pad_1"]["action"] == "clipboard.copy"
     _with_temp_config(body)
@@ -137,6 +139,53 @@ def test_import_rejects_garbage():
             ok, report = appconfig.import_config(p)
             assert not ok, f"{name} принят: {report}"
             assert json.dumps(appconfig.config, sort_keys=True) == before, f"{name} испортил конфиг"
+    _with_temp_config(body)
+
+
+def test_import_keeps_app_settings():
+    """Тема — настройка программы, а не пресета; свои цвета объединяются."""
+    def body(appconfig, d, json):
+        appconfig.config.clear()
+        appconfig.config.update({"version": 2, "bindings": {}, "theme": "light",
+                                 "custom_colors": ["#111111", "#222222"]})
+        p = os.path.join(d, "in.json")
+        json.dump({"version": 2, "bindings": {}, "theme": "dark",
+                   "custom_colors": ["#222222", "#333333", "мусор"]},
+                  open(p, "w", encoding="utf-8"))
+        ok, report = appconfig.import_config(p)
+        assert ok, report
+        assert appconfig.config["theme"] == "light"
+        assert appconfig.config["custom_colors"] == ["#111111", "#222222", "#333333"]
+        exp = os.path.join(d, "out.json")
+        appconfig.export_config(exp)
+        assert "theme" not in json.load(open(exp, encoding="utf-8"))
+    _with_temp_config(body)
+
+
+def test_presets_list_and_remember():
+    def body(appconfig, d, json):
+        from mvave import presets
+        appconfig.config.clear()
+        appconfig.config.update({"version": 2, "bindings": {"pad_1": {"action": "media.stop"}}})
+        assert presets.list_presets() == []
+        assert presets.clean_name(' a/b:c*?  ') == "a b c"
+        presets.save_preset("Мой/пресет")
+        items = presets.list_presets()
+        assert [i["name"] for i in items] == ["Мой пресет"] and items[0]["count"] == 1
+        # внешний файл: копия в пресеты; повтор того же файла — без дубля
+        ext = os.path.join(d, "с флешки.json")
+        appconfig.export_config(ext)
+        a = presets.remember_file(ext)
+        b = presets.remember_file(ext)
+        assert a == b and os.path.dirname(a) == appconfig.presets_dir()
+        # другой файл с тем же именем не затирает прежний
+        appconfig.config["bindings"]["pad_2"] = {"action": "media.next_track"}
+        appconfig.export_config(ext)
+        c = presets.remember_file(ext)
+        assert c != a and "(2)" in c
+        # файл из самой папки пресетов не копируется
+        assert presets.remember_file(a) == os.path.abspath(a)
+        assert len(presets.list_presets()) == 3
     _with_temp_config(body)
 
 

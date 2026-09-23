@@ -118,11 +118,30 @@ def save_config():
 # Ключи, которые принадлежат этой машине, а не настройке: адрес контроллера
 # у каждого свой, переносить его — значит сломать подключение на новом ПК.
 _MACHINE_KEYS = ("ble_address",)
+# Настройки самой программы, а не раскладки: смена пресета не должна
+# перекрашивать окно. Свои цвета палитры при этом не теряются, а
+# объединяются с пришедшими — см. import_config.
+_APP_KEYS = ("theme",)
 EXPORT_MARK = "mvave-smc-pad"
+MAX_CUSTOM_COLORS = 16
+
+
+def presets_dir():
+    """Папка пресетов — рядом с конфигом (в exe — рядом с exe).
+
+    Считается от CONFIG_FILE при каждом вызове: тесты подменяют путь
+    конфига, и пресеты должны уехать вместе с ним.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(CONFIG_FILE)), "presets")
+
+
+def backups_dir():
+    return os.path.join(presets_dir(), "_backups")
 
 
 def export_config(path):
-    data = {k: v for k, v in config.items() if k not in _MACHINE_KEYS}
+    data = {k: v for k, v in config.items()
+            if k not in _MACHINE_KEYS and k not in _APP_KEYS}
     data["app"] = EXPORT_MARK
     data["exported_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     _atomic_write(path, data)
@@ -164,19 +183,28 @@ def import_config(path):
     if not isinstance(loaded.get("bindings"), dict):
         return False, "Это не файл настроек: нет раздела bindings."
 
+    # Бэкапы — в presets/_backups: рядом с exe они копились россыпью.
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    bak = CONFIG_FILE.replace(".json", f".before-import-{stamp}.json")
+    bak = os.path.join(backups_dir(), f"midi_config.before-import-{stamp}.json")
     try:
+        os.makedirs(backups_dir(), exist_ok=True)
         _atomic_write(bak, config)
     except OSError as e:
         return False, f"Бэкап текущих настроек не создан, импорт отменён: {e}"
     if not os.path.exists(bak):
         return False, "Бэкап текущих настроек не появился, импорт отменён."
 
-    keep = {k: config[k] for k in _MACHINE_KEYS if k in config}
+    keep = {k: config[k] for k in _MACHINE_KEYS + _APP_KEYS if k in config}
     new = {k: v for k, v in loaded.items()
-           if k not in ("app", "exported_at") and k not in _MACHINE_KEYS}
+           if k not in ("app", "exported_at") and k not in _MACHINE_KEYS + _APP_KEYS}
     new.update(keep)
+    colors = [c for c in (config.get("custom_colors") or []) + (loaded.get("custom_colors") or [])
+              if isinstance(c, str) and c.startswith("#") and len(c) == 7]
+    colors = list(dict.fromkeys(c.lower() for c in colors))[:MAX_CUSTOM_COLORS]
+    if colors:
+        new["custom_colors"] = colors
+    else:
+        new.pop("custom_colors", None)
     config.clear()
     config.update(new)
     save_config()
