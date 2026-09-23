@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.bak
+*.log
+.venv/
+venv/
+
+# живые привязки владельца: личные пути, меняются из приложения
+midi_config.json
+
+# local-only: session handoff notes, history backups
+HANDOFF.md
+_backup/
