@@ -73,6 +73,73 @@ def test_execute():
     err = execute("unknown_action")
     assert err is not None and "Неизвестное действие" in err
 
+def _with_temp_config(fn):
+    """Прогнать fn на временном конфиге: боевой — живые настройки владельца."""
+    import json, shutil, tempfile
+    from mvave import appconfig
+    saved_path, saved = appconfig.CONFIG_FILE, dict(appconfig.config)
+    d = tempfile.mkdtemp()
+    appconfig.CONFIG_FILE = os.path.join(d, "midi_config.json")
+    try:
+        return fn(appconfig, d, json)
+    finally:
+        appconfig.CONFIG_FILE = saved_path
+        appconfig.config.clear(); appconfig.config.update(saved)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_export_import_roundtrip():
+    def body(appconfig, d, json):
+        appconfig.config.clear()
+        appconfig.config.update({
+            "version": 2, "pad_brightness": 40, "ble_address": "AA:AA:AA:AA:AA:AA",
+            "bindings": {
+                "pad_1": {"midi_id": 36, "action": "clipboard.copy", "color": "#ff0000"},
+                "pad_2": {"action": "custom.run", "param": "Z:/нет/такой.exe"},
+                "knob_3": {"mode": "pair", "ccw": {"action": "custom.folder", "param": "Z:/нет"},
+                           "cw": {"action": "media.next_track"}},
+            }})
+        appconfig.save_config()
+        exp = os.path.join(d, "export.json")
+        appconfig.export_config(exp)
+        data = json.load(open(exp, encoding="utf-8"))
+        assert "ble_address" not in data, "адрес машины уехал в экспорт"
+        assert data["app"] == appconfig.EXPORT_MARK
+
+        # «другой ПК»: свой адрес, пустые привязки
+        appconfig.config.clear()
+        appconfig.config.update({"version": 2, "bindings": {}, "ble_address": "BB:BB:BB:BB:BB:BB"})
+        appconfig.save_config()
+        ok, report = appconfig.import_config(exp)
+        assert ok, report
+        c = appconfig.config
+        assert c["bindings"]["pad_1"]["color"] == "#ff0000"
+        assert c["pad_brightness"] == 40
+        assert c["ble_address"] == "BB:BB:BB:BB:BB:BB", "импорт затёр адрес этой машины"
+        assert "app" not in c and "exported_at" not in c
+        assert "Z:/нет/такой.exe" in report and "knob_3" in report, report
+        baks = [f for f in os.listdir(d) if ".before-import-" in f]
+        assert baks, "бэкап перед импортом не создан"
+        on_disk = json.load(open(appconfig.CONFIG_FILE, encoding="utf-8"))
+        assert on_disk["bindings"]["pad_1"]["action"] == "clipboard.copy"
+    _with_temp_config(body)
+
+
+def test_import_rejects_garbage():
+    def body(appconfig, d, json):
+        appconfig.config.clear()
+        appconfig.config.update({"version": 2, "bindings": {"pad_1": {"action": "media.stop"}}})
+        before = json.dumps(appconfig.config, sort_keys=True)
+        for name, content in (("broken.json", "{не json"), ("list.json", "[1, 2]"),
+                              ("alien.json", '{"version": 2, "foo": 1}')):
+            p = os.path.join(d, name)
+            open(p, "w", encoding="utf-8").write(content)
+            ok, report = appconfig.import_config(p)
+            assert not ok, f"{name} принят: {report}"
+            assert json.dumps(appconfig.config, sort_keys=True) == before, f"{name} испортил конфиг"
+    _with_temp_config(body)
+
+
 def _main():
     tests = [(n, f) for n, f in globals().items() if n.startswith("test_") and callable(f)]
     failed = 0

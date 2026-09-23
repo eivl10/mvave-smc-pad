@@ -8,9 +8,17 @@
 import json
 import os
 import shutil
+import sys
+import time
 
 # Путь считается от КОРНЯ проекта, а не от каталога этого модуля.
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# В собранном .exe __file__ указывает во временную распаковку (_MEIPASS),
+# которая стирается при выходе, — настройки жили бы до первого закрытия.
+# Поэтому там конфиг кладём рядом с самим exe.
+if getattr(sys, "frozen", False):
+    _ROOT = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE = os.path.join(_ROOT, "midi_config.json")
 
 config = {}
@@ -86,6 +94,15 @@ def _migrate_v1_to_v2(old_conf):
 last_error = None
 
 
+def _atomic_write(path, data):
+    tmp_path = path + ".tmp"
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
 def save_config():
     """Атомарная запись: временный файл + os.replace.
 
@@ -94,12 +111,88 @@ def save_config():
     except в загрузке потом стирает все настройки. os.replace на Windows
     атомарен в пределах тома.
     """
-    tmp_path = CONFIG_FILE + ".tmp"
-    with open(tmp_path, 'w', encoding='utf-8') as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, CONFIG_FILE)
+    _atomic_write(CONFIG_FILE, config)
+
+
+# ── Перенос настроек между машинами ──────────────────────────────────────────
+# Ключи, которые принадлежат этой машине, а не настройке: адрес контроллера
+# у каждого свой, переносить его — значит сломать подключение на новом ПК.
+_MACHINE_KEYS = ("ble_address",)
+EXPORT_MARK = "mvave-smc-pad"
+
+
+def export_config(path):
+    data = {k: v for k, v in config.items() if k not in _MACHINE_KEYS}
+    data["app"] = EXPORT_MARK
+    data["exported_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    _atomic_write(path, data)
+
+
+def _missing_paths(bindings):
+    """Пути программ и папок из привязок, которых нет на этой машине."""
+    out = []
+    def check(uid, side):
+        if not isinstance(side, dict):
+            return
+        p = side.get("param")
+        act = side.get("action") or ""
+        if p and act in ("custom.run", "custom.folder") and not os.path.exists(str(p)):
+            out.append((uid, str(p)))
+    for uid, b in bindings.items():
+        check(uid, b)
+        for slot in ("ccw", "cw"):
+            check(uid, b.get(slot))
+    return out
+
+
+def import_config(path):
+    """Заменить настройки содержимым файла.
+
+    Возвращает (ok, отчёт). Текущий конфиг до замены копируется рядом —
+    без подтверждённого бэкапа импорт не выполняется. Битый или чужой файл
+    текущие настройки не трогает.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+    except (OSError, ValueError) as e:
+        return False, f"Файл не прочитан: {e}"
+    if not isinstance(loaded, dict):
+        return False, "Это не файл настроек: внутри не объект JSON."
+    if "version" not in loaded:
+        loaded = _migrate_v1_to_v2(loaded)   # экспорт самой первой версии
+    if not isinstance(loaded.get("bindings"), dict):
+        return False, "Это не файл настроек: нет раздела bindings."
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    bak = CONFIG_FILE.replace(".json", f".before-import-{stamp}.json")
+    try:
+        _atomic_write(bak, config)
+    except OSError as e:
+        return False, f"Бэкап текущих настроек не создан, импорт отменён: {e}"
+    if not os.path.exists(bak):
+        return False, "Бэкап текущих настроек не появился, импорт отменён."
+
+    keep = {k: config[k] for k in _MACHINE_KEYS if k in config}
+    new = {k: v for k, v in loaded.items()
+           if k not in ("app", "exported_at") and k not in _MACHINE_KEYS}
+    new.update(keep)
+    config.clear()
+    config.update(new)
+    save_config()
+
+    n = sum(1 for b in config["bindings"].values()
+            if isinstance(b, dict) and (b.get("action") not in (None, "none")
+                                        or b.get("ccw") or b.get("cw")))
+    lines = [f"Загружено назначений: {n}.",
+             f"Прежние настройки сохранены: {os.path.basename(bak)}"]
+    missing = _missing_paths(config["bindings"])
+    if missing:
+        lines.append("")
+        lines.append("На этом компьютере не найдены (назначения оставлены, "
+                     "путь можно поправить в панели справа):")
+        lines += [f"  {uid}: {p}" for uid, p in missing]
+    return True, "\n".join(lines)
 
 
 def load_config():
