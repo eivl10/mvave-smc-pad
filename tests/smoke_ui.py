@@ -233,15 +233,18 @@ def select_does_not_resend():
 check("выбор пэда не переписывает его цвет", select_does_not_resend)
 
 def color_status_from_device():
+    # Строка во вкладке «Цвет» говорит только о проблеме и молчит, когда всё хорошо
     midi_gui.ble.msg_queue.put("color:нет")
     app.check_queue()
     root.update_idletasks()
-    a = app._color_status_var.get()
+    a = app._color_hint_lbl.cget("text")
     midi_gui.ble.msg_queue.put("color:есть")
     app.check_queue()
     root.update_idletasks()
-    return (a, app._color_status_var.get())
-check("статус канала цвета доезжает в шапку", color_status_from_device)
+    b = app._color_hint_lbl.cget("text")
+    assert a and not b, (a, b)
+    return (a, b)
+check("канал цвета: сказано только о проблеме", color_status_from_device)
 
 print("\n── банк ────────────────────────────────────────────────")
 def bank_from_device():
@@ -525,10 +528,111 @@ def battery_messages():
 check("заряд: процент и прочерк при обрыве", battery_messages)
 
 def firmware_buttons_not_bindable():
-    assert not any(k in app.ui_elements for k in ("btn_9", "btn_10")), \
-        "Shift/Note Repeat попали в назначаемые элементы"
+    bad = [k for k in ("btn_1", "btn_2", "btn_3", "btn_9", "btn_10") if k in app.ui_elements]
+    assert not bad, f"служебные кнопки назначаются: {bad}"
+    # uid рабочих кнопок не сдвинулись: на них держатся назначения в конфигах
+    assert all(f"btn_{n}" in app.ui_elements for n in range(4, 9))
+    assert app._firmware_btns == ["BT", "PAD BANK", "KNOB BANK", "SHIFT", "NOTE REPEAT"], \
+        app._firmware_btns
     return len(app.ui_elements)
-check("Shift и Note Repeat не назначаются", firmware_buttons_not_bindable)
+check("BT, банки, Shift, Note Repeat — серые, не назначаются", firmware_buttons_not_bindable)
+
+print("\n── v0.3: пресеты, палитра, меню, тосты, тема ────────────")
+from mvave import dialogs, presets, theme
+
+def no_system_messagebox():
+    src = open(midi_gui.__file__, encoding="utf-8").read()
+    assert "messagebox" not in src and "colorchooser" not in src
+    return "только свои окна"
+check("в midi_gui нет системных окон сообщений", no_system_messagebox)
+
+def preset_save_list_open():
+    real_ask, real_confirm = dialogs.ask_text, dialogs.confirm
+    dialogs.ask_text = lambda *a, **k: "Смоук: тест/1"
+    dialogs.confirm = lambda *a, **k: True
+    try:
+        appconfig.config["bindings"].setdefault("pad_7", {})["action"] = "media.stop"
+        name = app._on_save_preset()
+        assert name == "Смоук тест 1", name
+        items = presets.list_presets()
+        assert any(i["name"] == name for i in items), items
+        appconfig.config["bindings"]["pad_7"]["action"] = "media.next_track"
+        it = next(i for i in items if i["name"] == name)
+        assert app._load_config_file(it["path"], name)
+        assert appconfig.config["bindings"]["pad_7"]["action"] == "media.stop"
+        root.update()
+        assert dialogs._toast["win"] is not None, "нет тоста после загрузки"
+        return f"{len(items)} пресет(ов), папка {os.path.basename(appconfig.presets_dir())}"
+    finally:
+        dialogs.ask_text, dialogs.confirm = real_ask, real_confirm
+check("пресет: сохранить → в списке → открыть", preset_save_list_open)
+
+def import_keeps_theme_and_palette():
+    appconfig.config["theme"] = "light"
+    appconfig.config["custom_colors"] = ["#123456"]
+    appconfig.save_config()
+    it = presets.list_presets()[0]
+    real_confirm = dialogs.confirm
+    dialogs.confirm = lambda *a, **k: True
+    try:
+        assert app._load_config_file(it["path"], it["name"])
+    finally:
+        dialogs.confirm = real_confirm
+    assert appconfig.config.get("theme") == "light", appconfig.config.get("theme")
+    assert "#123456" in appconfig.config.get("custom_colors", [])
+    appconfig.config["theme"] = "dark"
+    return "тема и свои цвета на месте"
+check("открытие пресета не сбрасывает тему и палитру", import_keeps_theme_and_palette)
+
+def palette_add_remove():
+    app.select_element("pad_5")
+    n0 = len(app._color_preset_btns)
+    app._add_custom_color("#abcdef")
+    app._add_custom_color("#ABCDEF")          # повтор не добавляется
+    n1 = len(app._color_preset_btns)
+    assert n1 == n0 + 1 or "#abcdef" in [c for c, _ in app._color_preset_btns][:n0], (n0, n1)
+    assert "#abcdef" in appconfig.config["custom_colors"]
+    app._remove_custom_color("#abcdef")
+    assert "#abcdef" not in appconfig.config["custom_colors"]
+    return f"кружков: {n0} → {n1} → {len(app._color_preset_btns)}"
+check("свой цвет остаётся в палитре и убирается", palette_add_remove)
+
+def menu_opens_and_closes():
+    app._open_settings_menu(); root.update()
+    m = dialogs.PopupMenu._current
+    assert m is not None and m.win.winfo_ismapped(), "меню не открылось"
+    m._born = False
+    dialogs.PopupMenu.close_current(); root.update()
+    assert dialogs.PopupMenu._current is None
+    return "открылось и закрылось"
+check("меню настроек открывается и закрывается", menu_opens_and_closes)
+
+def toast_replaces_previous():
+    dialogs.toast(root, "первый"); root.update()
+    first = dialogs._toast["win"]
+    dialogs.toast(root, "второй"); root.update()
+    assert dialogs._toast["win"] is not first and not first.winfo_exists()
+    dialogs._toast_close()
+    return "один тост за раз"
+check("новый тост заменяет старый", toast_replaces_previous)
+
+def theme_switch_roundtrip():
+    app.select_element("pad_3"); app._show_tab("Цвет"); root.update()
+    n = len(app.ui_elements)
+    label_before = app.ui_elements["pad_7"]["lbl"].cget("text")
+    app.set_theme("light"); root.update()
+    assert theme.applied == "light" and str(app.root.cget("bg")) == theme.BG
+    assert len(app.ui_elements) == n, "после пересборки другое число элементов"
+    assert app.current_sel == "pad_3" and app._tab_seg.get() == "Цвет"
+    assert app.ui_elements["pad_7"]["lbl"].cget("text") == label_before
+    assert appconfig.config["theme"] == "light"
+    app.set_theme("dark"); root.update()
+    assert theme.applied == "dark" and app.current_sel == "pad_3"
+    # после пересборки обработка MIDI жива
+    executed.clear()
+    midi_gui.ble.msg_queue.put("note:42:100"); app.check_queue()
+    return f"{n} элементов, выделение и вкладка сохранены"
+check("тема: тёмная → светлая → тёмная на ходу", theme_switch_roundtrip)
 
 root.destroy()
 

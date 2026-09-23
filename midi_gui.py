@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, colorchooser
+from tkinter import ttk, filedialog
 import threading
 import math
 import queue
@@ -13,6 +13,8 @@ from mvave import appconfig
 from mvave import volume_osd
 from mvave import tray
 from mvave import theme
+from mvave import dialogs
+from mvave import presets
 
 import customtkinter as ctk
 
@@ -240,8 +242,9 @@ class _TkClipboard:
 
 class UIKnob(tk.Canvas):
     """Endless encoder visual — indicator rotates freely, no min/max."""
-    def __init__(self, parent, size=50, bg_col="#1a1a1a"):
-        super().__init__(parent, width=size, height=size, bg=bg_col, highlightthickness=0)
+    def __init__(self, parent, size=50, bg_col=None):
+        super().__init__(parent, width=size, height=size, bg=bg_col or theme.SURFACE,
+                         highlightthickness=0)
         self.size = size
         self.angle = 225.0  # Current angle in degrees (starts at 7 o'clock)
         self.center = size // 2
@@ -258,16 +261,16 @@ class UIKnob(tk.Canvas):
         # Knob body
         self.create_oval(self.center - self.radius, self.center - self.radius,
                          self.center + self.radius, self.center + self.radius,
-                         fill="#222", outline="#444", width=2)
+                         fill=theme.KNOB_BODY, outline=theme.KNOB_RING, width=2)
         # Indicator line
         angle_rad = math.radians(self.angle)
         ix = self.center + (self.radius - 2) * math.cos(angle_rad)
         iy = self.center - (self.radius - 2) * math.sin(angle_rad)
-        self.create_line(self.center, self.center, ix, iy, fill="#fff", width=2)
+        self.create_line(self.center, self.center, ix, iy, fill=theme.KNOB_TICK, width=2)
         # Dot at tip
         dot_r = 2
         self.create_oval(ix - dot_r, iy - dot_r, ix + dot_r, iy + dot_r,
-                         fill="#00c8ff", outline="")
+                         fill=theme.ACCENT, outline="")
 
 
 class ToolTip:
@@ -339,11 +342,6 @@ class App:
         else:
             self.root.protocol("WM_DELETE_WINDOW", lambda: on_closing(root))
 
-        self.root.option_add('*TCombobox*Listbox.background', 'white')
-        self.root.option_add('*TCombobox*Listbox.foreground', 'black')
-        self.root.option_add('*TCombobox*Listbox.selectBackground', '#0078d7')
-        self.root.option_add('*TCombobox*Listbox.selectForeground', 'white')
-
         self.ui_elements = {}
         self.current_sel = None
         self.raw_knob_values = {}
@@ -353,6 +351,7 @@ class App:
         self._identify_mode = False
         self._learn_uid = None   # элемент, ждущий привязки к CC/ноте
         self._color_ok = False   # вендорский канал цвета доступен
+        self._color_known = False  # устройство уже ответило, есть ли канал
         self._color_base = ""    # цвет без яркости: ползунок не должен
                                  # умножать сам на себя при каждом движении
         self._pad_dim_job = None   # отложенная отправка общей яркости
@@ -363,9 +362,7 @@ class App:
         actions.set_clipboard_provider(_TkClipboard(root))
         actions.set_pad_brightness_provider(self._nudge_pad_brightness)
 
-        theme.apply_ttk(self.root)
-        ctk.set_appearance_mode("dark")
-
+        self._apply_theme(appconfig.config.get("theme", "dark"))
         self.build_ui()
 
         # Сбой в ЛЮБОМ обработчике Tk — в панель Ctrl+D, а не в stderr.
@@ -393,25 +390,86 @@ class App:
         inner.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
         return card, inner
 
-    def _lbl(self, parent, text="", fg=theme.TEXT, font=theme.F_SMALL, **kw):
-        return tk.Label(parent, text=text, fg=fg, bg=parent.cget("bg"),
-                        font=font, **kw)
+    def _lbl(self, parent, text="", fg=None, font=None, **kw):
+        # Цвет по умолчанию читается при вызове: значение по умолчанию в
+        # сигнатуре застыло бы на теме, активной при импорте модуля.
+        return tk.Label(parent, text=text, fg=fg or theme.TEXT, bg=parent.cget("bg"),
+                        font=font or theme.F_SMALL, **kw)
 
     def _btn(self, parent, text, command, kind="secondary", **kw):
-        colors = {
-            "primary": (theme.ACCENT, theme.ACCENT_HOVER, "#ffffff"),
-            "secondary": (theme.SURFACE_2, theme.SURFACE_3, theme.TEXT),
-            "success": (theme.OK_DARK, "#24503a", "#b8f5cf"),
-            "danger": (theme.DANGER_DARK, "#512730", "#ffb4b4"),
-        }[kind]
         kw.setdefault("height", 30)
-        kw.setdefault("corner_radius", theme.RADIUS_SM)
-        return ctk.CTkButton(parent, text=text, command=command,
-                             fg_color=colors[0], hover_color=colors[1],
-                             text_color=colors[2], font=theme.C_SMALL, **kw)
+        return dialogs.button(parent, text, command, kind=kind, **kw)
+
+    # ── Тема ──────────────────────────────────────────────────────────────────
+    def _apply_theme(self, mode):
+        theme.set_mode(mode)
+        ctk.set_appearance_mode(theme.applied)
+        theme.apply_ttk(self.root)
+        self.root.configure(bg=theme.BG)
+        theme.paint_titlebar(self.root)
+
+    def set_theme(self, mode):
+        """Сменить тему на ходу: пересобрать окно, сохранив состояние."""
+        if mode not in theme.MODES:
+            return
+        appconfig.config["theme"] = mode
+        self._save_config()
+        if theme.resolve(mode) == theme.applied and mode == theme.mode:
+            return
+        self._apply_theme(mode)
+        self.rebuild_ui()
+
+    def rebuild_ui(self):
+        """Уничтожить и заново собрать интерфейс.
+
+        Виджеты читают цвета темы при создании, перекрашивать каждый на ходу
+        — значит держать реестр «виджет → свойство → токен» и не забыть ни
+        одного. Пересборка проще и полнее; выделение, вкладка пэда и режим
+        Ctrl+D возвращаются явно. Трей, BLE-поток и очереди не трогаются:
+        они не виджеты.
+        """
+        sel = self.current_sel
+        tab = self._tab_seg.get() if hasattr(self, "_tab_seg") else "Действие"
+        debug = getattr(self, "_debug_visible", False)
+        lines = list(getattr(self, "_debug_lines", []))
+        status, battery = self.status_var.get(), self._battery_pct
+        last_input = self.last_input_var.get()
+        if self._pad_dim_job is not None:
+            self.root.after_cancel(self._pad_dim_job)
+            self._pad_dim_job = None
+            self._save_config()
+        dialogs.PopupMenu.close_current()
+        for w in self.root.winfo_children():
+            w.destroy()
+        # CTk-виджет подменяет config/configure у tk-родителя, чтобы тот
+        # пересылал ему смену фона. Виджет уничтожен, подмена осталась — и
+        # следующий root.configure(bg=…) падал на мёртвом «.!ctkframe».
+        for attr in ("config", "configure"):
+            self.root.__dict__.pop(attr, None)
+        # Индикатор громкости — тоже дочернее окно root, он пересоздастся сам
+        if self._volume_osd is not False:
+            self._volume_osd = None
+        self.ui_elements = {}
+        self.current_sel = None
+        self._learn_uid = None
+        self.build_ui()
+        self._debug_lines = lines
+        if debug:
+            self._toggle_debug()
+        self.status_var.set(status)
+        self.last_input_var.set(last_input)
+        self._set_battery(battery if battery is not None else -1)
+        self._bank_var.set(f"Банк {self._current_bank}")
+        self.load_hardware_mapping()
+        self.update_ui_from_config()
+        if sel in self.ui_elements:
+            self.select_element(sel)
+            if self.ui_elements[sel]["type"] == "pad":
+                self._show_tab(tab)
 
     def build_ui(self):
         self.root.configure(bg=theme.BG)
+        self._firmware_btns = []
 
         # ── Шапка: состояние устройства + общие настройки ────────────────────
         head_card, header = self._card(self.root)
@@ -444,14 +502,15 @@ class App:
                  font=theme.F_SMALL, padx=10, pady=2).pack(side=tk.LEFT, padx=(18, 0))
 
         if appconfig.last_error:
-            self._lbl(row1, f"⚠ {appconfig.last_error}", fg=theme.DANGER).pack(
+            self._lbl(row1, appconfig.last_error, fg=theme.WARN).pack(
                 side=tk.LEFT, padx=10)
 
         self._identify_var = tk.BooleanVar(value=False)
         ctk.CTkSwitch(row1, text="Определить", variable=self._identify_var,
                       onvalue=True, offvalue=False, command=self._on_identify_toggle,
                       font=theme.C_SMALL, text_color=theme.MUTED,
-                      progress_color=theme.ACCENT, button_color=theme.TEXT,
+                      progress_color=theme.ACCENT, button_color="#ffffff",
+                      button_hover_color="#ffffff",
                       fg_color=theme.SURFACE_3, switch_width=34, switch_height=18,
                       width=110).pack(side=tk.LEFT, padx=(18, 0))
 
@@ -461,18 +520,12 @@ class App:
                                       font=theme.F_SMALL + ("bold",), padx=10, pady=2)
 
         self._settings_btn = self._btn(row1, "Настройки  ▾", self._open_settings_menu,
-                                       width=120)
+                                       width=124, height=32)
         self._settings_btn.pack(side=tk.RIGHT)
 
         self.last_input_var = tk.StringVar(value="")
-        self._lbl(row1, fg=theme.ACCENT, font=theme.F_SMALL,
+        self._lbl(row1, fg=theme.MUTED, font=theme.F_SMALL,
                   textvariable=self.last_input_var).pack(side=tk.RIGHT, padx=(0, 16))
-
-        # Цвет уходит на устройство по отдельному вендорскому каналу. Если его
-        # нет — цвет останется только на экране, и об этом надо сказать вслух.
-        self._color_status_var = tk.StringVar(value="цвет: ждём устройство")
-        self._lbl(row1, fg=theme.DIM, font=theme.F_TINY,
-                  textvariable=self._color_status_var).pack(side=tk.RIGHT, padx=(0, 16))
 
         # ── Общая яркость подсветки ──────────────────────────────────────────
         # Один фейдер на все 16 пэдов. Яркость конкретного пэда остаётся
@@ -485,14 +538,12 @@ class App:
         self._pad_dim_scale = ctk.CTkSlider(
             row2, from_=0, to=100, number_of_steps=100, variable=self._pad_dim_var,
             command=self._on_pad_dim_change, width=300, height=16,
-            progress_color=theme.ACCENT, button_color=theme.TEXT,
-            button_hover_color="#ffffff", fg_color=theme.SURFACE_3)
+            progress_color=theme.ACCENT, button_color=theme.ACCENT,
+            button_hover_color=theme.ACCENT_HOVER, fg_color=theme.SURFACE_3)
         self._pad_dim_scale.pack(side=tk.LEFT)
         self._pad_dim_lbl = self._lbl(row2, "", fg=theme.TEXT, font=theme.F_BOLD, width=5)
         self._pad_dim_lbl.pack(side=tk.LEFT, padx=(8, 0))
         self._pad_dim_lbl.config(text=f"{self._pad_dim_var.get()}%")
-        self._lbl(row2, "можно и крутилкой: Подсветка → Яркость пэдов",
-                  fg=theme.DIM, font=theme.F_TINY).pack(side=tk.LEFT, padx=16)
 
         # ── Основная область: схема слева, панель справа ─────────────────────
         main_area = tk.Frame(self.root, bg=theme.BG)
@@ -572,20 +623,35 @@ class App:
         btn_panel = tk.Frame(device_frame, bg=S)
         btn_panel.grid(row=1, column=3, padx=(10, 0), sticky="n", pady=(8, 0))
 
+        # Колонка — в порядке корпуса. Служебные кнопки (BT, банки, Shift,
+        # Note Repeat) обрабатывает прошивка: в компьютер они не передают
+        # ничего, на что можно повесить действие (замер 2026-09-23,
+        # docs/PROTOCOL.md §1). Они серые и не выбираются, объяснение — в
+        # подсказке. uid рабочих кнопок остались btn_4..btn_8: на них
+        # держатся назначения в конфигах и пресетах.
+        fw = "Её обрабатывает сам контроллер, в компьютер она ничего не передаёт — " \
+             "назначить на неё действие нельзя."
         btn_defs = [
-            ("BT",       "#003355", "#8cf", 8),
-            ("PAD BNK",  "#664400", "#fc0", 8),
-            ("KNOB BNK", "#333333", "#ccc", 8),
-            ("◀",        "#2a3a3a", "#8cc", 11),
-            ("▶",        "#2a3a3a", "#8cc", 11),
-            ("▶",        "#2a3a3a", "#8df", 11),
+            ("fw", "BT", "Bluetooth. " + fw),
+            ("fw", "PAD BANK", "Банк пэдов. " + fw + " Номер банка программа узнаёт "
+                               "по нотам и показывает в шапке."),
+            ("fw", "KNOB BANK", "Банк крутилок. " + fw),
+            (4, "◀", None),
+            (5, "▶", None),
+            (6, "▶", None),
             # ⏸ и ⏺ Tkinter на Windows рисует пустым квадратом — проверено на
             # снимке окна. Берём глифы из базового набора Segoe UI.
-            ("‖",        "#2a3a3a", "#8df", 11),
-            ("●",        "#2a3a3a", "#8df", 11),
+            (7, "‖", None),
+            (8, "●", None),
+            ("fw", "SHIFT", "Shift. " + fw + " Shift+пэд — пресеты, чувствительность, октава."),
+            ("fw", "NOTE REPEAT", "Note Repeat. " + fw),
         ]
-        for num, (icon, bg, fg, fsize) in enumerate(btn_defs, 1):
+        for num, icon, tip in btn_defs:
+            if num == "fw":
+                self._firmware_button(btn_panel, icon, tip)
+                continue
             uid = f"btn_{num}"
+            bg = theme.BTN_BG
             outer = tk.Frame(btn_panel, bg=S, padx=1, pady=1)
             outer.pack(pady=2)
             # Ширину держит рамка, а подпись действия режется с «…» в
@@ -598,13 +664,14 @@ class App:
             # Номер и значок кнопки видны ВСЕГДА. Раньше подпись назначенного
             # действия затирала значок, и понять, какая это физическая кнопка,
             # было уже нельзя.
-            lbl_num = tk.Label(f, text=str(num), fg="#888", bg=bg,
-                               font=(theme.FONT, 7))
-            lbl_num.pack(side=tk.LEFT, padx=(6, 3))
-            lbl_icon = tk.Label(f, text=icon, fg=fg, bg=bg, anchor="w",
-                                font=(theme.FONT, fsize, "bold"))
+            # Номер не пишется: служебные кнопки выпали из нумерации, и «4»
+            # у первой рабочей кнопки только сбивал бы. Кнопку опознаёт значок.
+            lbl_num = tk.Label(f, text="", fg=theme.DIM, bg=bg, font=(theme.FONT, 7))
+            lbl_num.pack(side=tk.LEFT, padx=(8, 0))
+            lbl_icon = tk.Label(f, text=icon, fg=theme.BTN_ICON, bg=bg, anchor="w",
+                                font=(theme.FONT, 11, "bold"))
             lbl_icon.pack(side=tk.LEFT)
-            lbl_act = tk.Label(f, text="", fg="#0f0", bg=bg, anchor="e",
+            lbl_act = tk.Label(f, text="", fg=theme.OK, bg=bg, anchor="e",
                                font=theme.F_TINY)
             lbl_act.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(3, 8))
 
@@ -614,26 +681,6 @@ class App:
                                      "midi_kind": None, "icon": icon}
             self.bind_click(outer, uid, f, lbl_num, lbl_icon, lbl_act)
             self._attach_tooltip(outer, uid)
-
-        # Shift и Note Repeat в эфир не шлют ничего — замер 2026-09-23,
-        # docs/PROTOCOL.md §1. Показаны, чтобы схема совпадала с корпусом,
-        # но выбрать их нельзя: назначить действие не на что.
-        tk.Label(btn_panel, text="обрабатывает сам контроллер", fg=theme.DIM, bg=S,
-                 font=(theme.FONT, 7)).pack(anchor="w", pady=(8, 1))
-        fw_tip = ("Эту кнопку обрабатывает прошивка контроллера (Shift+пэд — "
-                  "пресеты, чувствительность, октава). В компьютер она "
-                  "ничего не передаёт, поэтому назначить на неё действие нельзя.")
-        for icon in ("SHIFT", "NOTE RPT"):
-            outer = tk.Frame(btn_panel, bg=S, padx=1, pady=1)
-            outer.pack(pady=2)
-            f = tk.Frame(outer, width=172, height=30, bg=theme.SURFACE_2)
-            f.pack()
-            f.pack_propagate(False)
-            tk.Label(f, text=icon, fg=theme.DIM, bg=theme.SURFACE_2, anchor="w",
-                     font=(theme.FONT, 8, "bold")).pack(side=tk.LEFT, padx=(18, 0))
-            tk.Label(f, text="прошивка", fg=theme.DIM, bg=theme.SURFACE_2, anchor="e",
-                     font=(theme.FONT, 7)).pack(side=tk.RIGHT, padx=8)
-            ToolTip(outer, lambda: fw_tip)
 
         # ── RIGHT INSPECTOR PANEL ─────────────────────────────────────────────
         self._build_inspector(main_area)
@@ -648,6 +695,19 @@ class App:
         self._debug_text.pack(fill=tk.X, padx=2, pady=2)
         self.root.bind("<Control-d>", self._toggle_debug)
         self.root.bind("<Control-D>", self._toggle_debug)
+
+    def _firmware_button(self, parent, text, tip):
+        """Серая кнопка схемы, которую обрабатывает прошивка: не выбирается."""
+        outer = tk.Frame(parent, bg=theme.SURFACE, padx=1, pady=1)
+        outer.pack(pady=2)
+        f = tk.Frame(outer, width=172, height=30, bg=theme.FW_BG)
+        f.pack()
+        f.pack_propagate(False)
+        lbl = tk.Label(f, text=text, fg=theme.FW_TEXT, bg=theme.FW_BG, anchor="w",
+                       font=(theme.FONT, 8, "bold"))
+        lbl.pack(side=tk.LEFT, padx=(12, 0))
+        ToolTip(outer, lambda: tip)
+        self._firmware_btns.append(text)
 
     # ── Индикаторы шапки ──────────────────────────────────────────────────────
     def _draw_status_dot(self):
@@ -687,65 +747,209 @@ class App:
 
     # ── Меню «Настройки»: перенос на другой компьютер ────────────────────────
     def _open_settings_menu(self):
-        m = tk.Menu(self.root, tearoff=False, bg=theme.SURFACE_2, fg=theme.TEXT,
-                    activebackground=theme.ACCENT, activeforeground="#ffffff",
-                    bd=0, font=theme.F_SMALL)
-        m.add_command(label="Сохранить настройки в файл…", command=self._on_export)
-        m.add_command(label="Загрузить настройки из файла…", command=self._on_import)
-        m.add_separator()
-        m.add_command(label="Открыть папку с настройками", command=self._on_open_config_dir)
-        b = self._settings_btn
-        m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height() + 4)
+        if dialogs.PopupMenu._current is not None:
+            dialogs.PopupMenu.close_current()
+            return
+        m = dialogs.PopupMenu(self.root, width=272)
+        m.item("Пресеты", self._open_presets, "\ue8f1")
+        m.item("Сохранить как пресет", self._on_save_preset, "\ue74e")
+        m.separator()
+        m.item("Экспорт в файл", self._on_export, "\ue898")
+        m.item("Импорт из файла", self._on_import, "\ue896")
+        m.item("Открыть папку с настройками", self._on_open_config_dir, "\ue838")
+        m.separator()
+        m.caption("Тема")
+        names = {v: k for k, v in theme.MODE_NAMES.items()}
+
+        def pick(label):
+            m.close()
+            self.root.after(30, lambda: self.set_theme(names[label]))
+        seg = self._segmented(m.body, [theme.MODE_NAMES[k] for k in theme.MODES], pick)
+        seg.configure(font=theme.C_TINY, height=28)
+        seg.set(theme.MODE_NAMES[theme.mode])
+        seg.pack(fill=tk.X, padx=8, pady=(0, 8))
+        m.show_below(self._settings_btn)
+
+    def _after_config_replaced(self):
+        """Настройки заменены целиком — привести окно и железо к ним."""
+        self._pad_dim_var.set(int(appconfig.config.get("pad_brightness", 100)))
+        self._pad_dim_lbl.config(text=f"{self._pad_dim_var.get()}%")
+        self._build_palette()
+        self.load_hardware_mapping()
+        self.update_ui_from_config()
+        if self.current_sel:
+            self.select_element(self.current_sel)
+        self._on_resend_colors()
+
+    def _load_config_file(self, path, name, remember=False):
+        """Общий путь «Открыть пресет» и «Импорт»: вопрос → загрузка → отчёт.
+
+        remember — положить копию файла в пресеты, но только после успешной
+        загрузки: битый файл в списке пресетов не нужен.
+        """
+        if not dialogs.confirm(
+                self.root, f"Открыть «{name}»?",
+                "Назначения, цвета и яркость заменятся настройками пресета. "
+                "Текущие сохранятся в резервную копию.", ok_text="Открыть"):
+            return False
+        ok, report = presets.load_preset(path)
+        if not ok:
+            dialogs.alert(self.root, "Настройки не загружены", report, kind="error")
+            return False
+        if remember:
+            # Второй раз файл откроется из списка пресетов, без поиска
+            try:
+                presets.remember_file(path)
+            except OSError as e:
+                self._debug_log(f"копия в пресеты не сделана: {e}")
+        self._after_config_replaced()
+        missing = report.split("\n\n", 1)
+        if len(missing) > 1:
+            # Пути программ и папок, которых нет на этом компьютере
+            dialogs.alert(self.root, f"«{name}» открыт",
+                          missing[1], kind="warn")
+        else:
+            dialogs.toast(self.root, f"Открыт пресет «{name}»")
+        return True
+
+    def _on_save_preset(self, initial=None):
+        name = dialogs.ask_text(
+            self.root, "Сохранить как пресет", "Название",
+            initial=initial or time.strftime("Пресет %d.%m.%Y"), ok_text="Сохранить")
+        if not name:
+            return None
+        name = presets.clean_name(name)
+        if not name:
+            dialogs.alert(self.root, "Пресет не сохранён",
+                          "В названии нет ни одного допустимого символа.", kind="warn")
+            return None
+        if presets.exists(name) and not dialogs.confirm(
+                self.root, "Заменить пресет?",
+                f"Пресет «{name}» уже есть. Заменить его текущими настройками?",
+                ok_text="Заменить"):
+            return None
+        try:
+            presets.save_preset(name)
+        except (OSError, ValueError) as e:
+            dialogs.alert(self.root, "Пресет не сохранён", str(e), kind="error")
+            return None
+        dialogs.toast(self.root, f"Пресет «{name}» сохранён")
+        return name
+
+    def _open_presets(self):
+        """Окно со списком пресетов: открыть или удалить без выбора файла."""
+        m = dialogs.Modal(self.root, "Пресеты", width=460)
+        top = tk.Frame(m.body, bg=theme.ELEVATED)
+        top.pack(fill=tk.X, pady=(12, 12))
+        dialogs.label(top, "Сохранённые и загруженные раньше настройки.",
+                      fg=theme.MUTED, font=theme.F_SMALL, anchor="w").pack(side=tk.LEFT)
+
+        holder = tk.Frame(m.body, bg=theme.ELEVATED)
+        holder.pack(fill=tk.BOTH, expand=True)
+
+        def fill():
+            for w in holder.winfo_children():
+                w.destroy()
+            items = presets.list_presets()
+            if not items:
+                dialogs.label(holder, "Пока пусто. Сохраните текущие настройки "
+                                      "кнопкой ниже.", fg=theme.MUTED,
+                              font=theme.F_BODY, anchor="w", justify=tk.LEFT,
+                              wraplength=400).pack(fill=tk.X, pady=(4, 8))
+                return
+            area = holder
+            if len(items) > 6:
+                area = ctk.CTkScrollableFrame(
+                    holder, height=6 * 60, fg_color=theme.ELEVATED,
+                    scrollbar_button_color=theme.SURFACE_3,
+                    scrollbar_button_hover_color=theme.DIM)
+                area.pack(fill=tk.BOTH, expand=True)
+            for it in items:
+                row = ctk.CTkFrame(area, fg_color=theme.SURFACE_2,
+                                   corner_radius=theme.RADIUS_SM, border_width=0)
+                row.pack(fill=tk.X, pady=(0, 8))
+                inner = tk.Frame(row, bg=theme.SURFACE_2)
+                inner.pack(fill=tk.X, padx=12, pady=8)
+                txt = tk.Frame(inner, bg=theme.SURFACE_2)
+                txt.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                tk.Label(txt, text=it["name"], fg=theme.TEXT, bg=theme.SURFACE_2,
+                         font=theme.F_BOLD, anchor="w").pack(fill=tk.X)
+                when = time.strftime("%d.%m.%Y %H:%M", time.localtime(it["mtime"]))
+                n = it["count"]
+                sub = when if n is None else f"{when} · назначений: {n}"
+                tk.Label(txt, text=sub, fg=theme.MUTED, bg=theme.SURFACE_2,
+                         font=theme.F_SMALL, anchor="w").pack(fill=tk.X)
+                dialogs.icon_button(
+                    inner, "\ue74d", lambda it=it: delete(it),
+                    fg_color=theme.SURFACE_2, border_color=theme.SURFACE_2,
+                    hover_color=theme.DANGER_DARK, text_color=theme.MUTED
+                ).pack(side=tk.RIGHT, padx=(8, 0))
+                dialogs.button(inner, "Открыть", lambda it=it: open_(it),
+                               kind="primary", width=92).pack(side=tk.RIGHT)
+
+        def open_(it):
+            m.close(None)
+            self._load_config_file(it["path"], it["name"])
+
+        def delete(it):
+            if not dialogs.confirm(self.root, "Удалить пресет?",
+                                   f"«{it['name']}» уйдёт в Корзину, оттуда его "
+                                   f"можно вернуть.", ok_text="Удалить", danger=True):
+                m.win.grab_set()
+                return
+            if presets.delete_preset(it["path"]):
+                dialogs.toast(self.root, f"Пресет «{it['name']}» в Корзине")
+            else:
+                dialogs.alert(self.root, "Пресет не удалён",
+                              "Корзина недоступна. Файл остался на месте — его "
+                              "можно удалить из папки с настройками.", kind="warn")
+            fill()
+            m.win.grab_set()
+            m.win.focus_force()
+
+        def save_new():
+            m.close(None)
+            if self._on_save_preset():
+                self._open_presets()
+
+        fill()
+        bottom = tk.Frame(m.body, bg=theme.ELEVATED)
+        bottom.pack(fill=tk.X, pady=(8, 0))
+        dialogs.button(bottom, "Сохранить текущие", save_new, kind="secondary",
+                       width=170).pack(side=tk.LEFT)
+        dialogs.button(bottom, "Закрыть", lambda: m.close(None), kind="secondary",
+                       width=96).pack(side=tk.RIGHT)
+        m.show()
 
     def _on_export(self):
         name = time.strftime("smc-pad-настройки-%Y-%m-%d.json")
         path = filedialog.asksaveasfilename(
-            parent=self.root, title="Сохранить настройки", initialfile=name,
+            parent=self.root, title="Экспорт настроек", initialfile=name,
             defaultextension=".json", filetypes=[("Настройки SMC-PAD", "*.json")])
         if not path:
             return
         try:
             appconfig.export_config(path)
         except OSError as e:
-            messagebox.showerror("Настройки не сохранены", str(e), parent=self.root)
+            dialogs.alert(self.root, "Настройки не сохранены", str(e), kind="error")
             return
-        messagebox.showinfo(
-            "Настройки сохранены",
-            f"{path}\n\nНа другом компьютере: Настройки → «Загрузить настройки "
-            f"из файла…». Адрес контроллера в файл не попадает — там он "
-            f"найдётся сам.", parent=self.root)
+        dialogs.toast(self.root, f"Сохранено: {os.path.basename(path)}. На другом "
+                                 f"компьютере — «Импорт из файла».")
 
     def _on_import(self):
         path = filedialog.askopenfilename(
-            parent=self.root, title="Загрузить настройки",
+            parent=self.root, title="Импорт настроек",
             filetypes=[("Настройки SMC-PAD", "*.json"), ("Все файлы", "*.*")])
         if not path:
             return
-        if not messagebox.askyesno(
-                "Заменить настройки?",
-                "Все назначения, цвета и яркость заменятся настройками из файла.\n"
-                "Текущие сохранятся рядом отдельным файлом — к ним можно вернуться "
-                "тем же пунктом меню.", parent=self.root):
-            return
-        ok, report = appconfig.import_config(path)
-        if not ok:
-            messagebox.showerror("Настройки не загружены", report, parent=self.root)
-            return
-        self._pad_dim_var.set(int(appconfig.config.get("pad_brightness", 100)))
-        self._pad_dim_lbl.config(text=f"{self._pad_dim_var.get()}%")
-        self.load_hardware_mapping()
-        self.update_ui_from_config()
-        if self.current_sel:
-            self.select_element(self.current_sel)
-        self._on_resend_colors()
-        show = messagebox.showwarning if "не найдены" in report else messagebox.showinfo
-        show("Настройки загружены", report, parent=self.root)
+        name = os.path.splitext(os.path.basename(path))[0]
+        self._load_config_file(path, name, remember=True)
 
     def _on_open_config_dir(self):
         try:
             os.startfile(os.path.dirname(os.path.abspath(appconfig.CONFIG_FILE)))
         except OSError as e:
-            messagebox.showerror("Папка не открылась", str(e), parent=self.root)
+            dialogs.alert(self.root, "Папка не открылась", str(e), kind="error")
 
     # ── Inspector panel ───────────────────────────────────────────────────────
     def _build_inspector(self, parent):
@@ -804,12 +1008,9 @@ class App:
         self._knob_mode_frame = tk.Frame(self._insp_content, bg=S)
         self._knob_mode_var = tk.StringVar(value="delta")
         self._knob_mode_names = {"delta": "Плавно", "pair": "Влево / вправо"}
-        self._knob_mode_seg = ctk.CTkSegmentedButton(
-            self._knob_mode_frame, values=list(self._knob_mode_names.values()),
-            command=self._on_knob_mode_seg, font=theme.C_SMALL, height=30,
-            fg_color=theme.SURFACE_2, unselected_color=theme.SURFACE_2,
-            unselected_hover_color=theme.SURFACE_3, selected_color=theme.ACCENT,
-            selected_hover_color=theme.ACCENT_HOVER, text_color=theme.TEXT)
+        self._knob_mode_seg = self._segmented(
+            self._knob_mode_frame, list(self._knob_mode_names.values()),
+            self._on_knob_mode_seg)
         self._knob_mode_seg.pack(fill=tk.X)
         # Переключатель — только отображение. Источник правды — переменная:
         # её выставляют select_element и тесты, трасса держит кнопку в согласии.
@@ -826,7 +1027,8 @@ class App:
             ctk.CTkRadioButton(row, text=text, variable=self._pair_slot, value=value,
                                command=self._on_pair_slot_change, font=theme.C_SMALL,
                                text_color=theme.TEXT, fg_color=theme.ACCENT,
-                               border_color=theme.SURFACE_3, width=100,
+                               hover_color=theme.ACCENT_HOVER,
+                               border_color=theme.BORDER, width=100,
                                radiobutton_width=16, radiobutton_height=16).pack(side=tk.LEFT)
             lbl = tk.Label(row, text="—", fg=theme.MUTED, bg=S, font=theme.F_SMALL,
                            anchor="w")
@@ -837,12 +1039,8 @@ class App:
                 self._pair_cw_lbl = lbl
 
         # === 2c. Вкладки пэда: «Действие» / «Цвет» ===
-        self._tab_seg = ctk.CTkSegmentedButton(
-            self._insp_content, values=["Действие", "Цвет"], command=self._show_tab,
-            font=theme.C_SMALL, height=30, fg_color=theme.SURFACE_2,
-            unselected_color=theme.SURFACE_2, unselected_hover_color=theme.SURFACE_3,
-            selected_color=theme.SURFACE_3, selected_hover_color=theme.SURFACE_3,
-            text_color=theme.TEXT)
+        self._tab_seg = self._segmented(self._insp_content, ["Действие", "Цвет"],
+                                        self._show_tab)
         self._tab_seg.set("Действие")
         # Not packed yet — shown only for pads
 
@@ -856,11 +1054,7 @@ class App:
         search_frame.pack(fill=tk.X, pady=(0, 6))
         self._search_var = tk.StringVar()
         self._search_placeholder_active = False   # плейсхолдер рисует сам CTkEntry
-        self._search_entry = ctk.CTkEntry(
-            search_frame, placeholder_text="Поиск действия…", height=32,
-            font=theme.C_SMALL, fg_color=theme.SURFACE_2, border_color=theme.SURFACE_3,
-            border_width=1, text_color=theme.TEXT, placeholder_text_color=theme.DIM,
-            corner_radius=theme.RADIUS_SM)
+        self._search_entry = dialogs.entry(search_frame, placeholder_text="Поиск действия")
         self._search_entry.pack(fill=tk.X)
         # textvariable у CTkEntry отключает плейсхолдер — поэтому переменная
         # поиска кормится с клавиатуры, а не привязкой.
@@ -894,14 +1088,12 @@ class App:
                                      bg=S, font=theme.F_SMALL)
         self._param_label.pack(side=tk.LEFT, padx=(0, 8))
         self._param_var = tk.StringVar()
-        self._param_entry = ctk.CTkEntry(
-            self._param_frame, textvariable=self._param_var, height=30,
-            font=theme.C_SMALL, fg_color=theme.SURFACE_2, border_color=theme.SURFACE_3,
-            border_width=1, text_color=theme.TEXT, corner_radius=theme.RADIUS_SM)
+        self._param_entry = dialogs.entry(self._param_frame, textvariable=self._param_var,
+                                          height=30)
         self._param_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self._param_entry.bind("<FocusOut>", self._on_param_commit)
+        self._param_entry.bind("<FocusOut>", self._on_param_commit, add="+")
         self._param_entry.bind("<Return>", self._on_param_commit)
-        self._param_btn = self._btn(self._param_frame, "Обзор…", self._on_param_browse,
+        self._param_btn = self._btn(self._param_frame, "Обзор", self._on_param_browse,
                                     width=86)
         self._param_btn.pack(side=tk.LEFT, padx=(6, 0))
         # Not packed yet
@@ -911,34 +1103,19 @@ class App:
         self._color_frame = self._tab_color   # прежнее имя: на него ссылается код
 
         self._lbl(self._tab_color, "Цвет пэда", fg=theme.MUTED).pack(anchor="w")
-        pal = tk.Frame(self._tab_color, bg=S)
-        pal.pack(fill=tk.X, pady=(6, 10))
-        self._color_preset_btns = []
-        for i, hex_c in enumerate(COLOR_PRESETS):
-            btn = ctk.CTkButton(pal, text="", width=26, height=26, corner_radius=13,
-                                fg_color=hex_c, hover_color=hex_c,
-                                border_width=2 if hex_c == "#000000" else 0,
-                                border_color=theme.SURFACE_3,
-                                command=lambda c=hex_c: self._apply_color(c))
-            btn.grid(row=i // 6, column=i % 6, padx=3, pady=3)
-            self._color_preset_btns.append((hex_c, btn))
-        # Свой цвет — такой же кружок: широкая кнопка раздвигала колонку сетки
-        custom = self._btn(pal, "+", self._pick_custom_color, width=26, height=26,
-                           corner_radius=13)
-        custom.grid(row=1, column=5, padx=3, pady=3)
-        ToolTip(custom, lambda: "Свой цвет…")
+        self._palette = tk.Frame(self._tab_color, bg=S)
+        self._palette.pack(fill=tk.X, pady=(6, 10))
+        self._build_palette()
 
         hexrow = tk.Frame(self._tab_color, bg=S)
         hexrow.pack(fill=tk.X, pady=(0, 10))
         self._lbl(hexrow, "Код", fg=theme.MUTED).pack(side=tk.LEFT, padx=(0, 8))
         self._color_hex_var = tk.StringVar()
-        color_hex_entry = ctk.CTkEntry(
-            hexrow, textvariable=self._color_hex_var, width=100, height=30,
-            font=theme.C_MONO, fg_color=theme.SURFACE_2, border_color=theme.SURFACE_3,
-            border_width=1, text_color=theme.TEXT, corner_radius=theme.RADIUS_SM)
+        color_hex_entry = dialogs.entry(hexrow, textvariable=self._color_hex_var,
+                                        width=100, height=30, font=theme.C_MONO)
         color_hex_entry.pack(side=tk.LEFT)
         color_hex_entry.bind("<Return>", self._on_color_hex_commit)
-        color_hex_entry.bind("<FocusOut>", self._on_color_hex_commit)
+        color_hex_entry.bind("<FocusOut>", self._on_color_hex_commit, add="+")
 
         brow = tk.Frame(self._tab_color, bg=S)
         brow.pack(fill=tk.X, pady=(0, 10))
@@ -947,21 +1124,22 @@ class App:
         self._brightness_scale = ctk.CTkSlider(
             brow, from_=10, to=100, number_of_steps=90, variable=self._brightness_var,
             command=self._on_brightness_change, height=16,
-            progress_color=theme.ACCENT, button_color=theme.TEXT,
-            button_hover_color="#ffffff", fg_color=theme.SURFACE_3)
+            progress_color=theme.ACCENT, button_color=theme.ACCENT,
+            button_hover_color=theme.ACCENT_HOVER, fg_color=theme.SURFACE_3)
         self._brightness_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # «Как отправить цвет на пэд» не должно быть вопросом: цвет уходит
-        # сразу при выборе. Кнопка нужна на случай, когда устройство
-        # переподключилось — записи цвета волатильные.
+        # Цвет уходит на пэд сразу при выборе — говорить об этом незачем.
+        # Строка появляется только при проблеме: канал цвета недоступен.
+        # Кнопка нужна на случай, когда устройство переподключилось —
+        # записи цвета волатильные.
         crow = tk.Frame(self._tab_color, bg=S)
         crow.pack(fill=tk.X)
-        self._color_hint_lbl = tk.Label(crow, text="", fg=theme.MUTED, bg=S,
-                                        font=theme.F_TINY, anchor="w", justify=tk.LEFT,
-                                        wraplength=220)
+        self._color_hint_lbl = tk.Label(crow, text="", fg=theme.WARN, bg=S,
+                                        font=theme.F_SMALL, anchor="w", justify=tk.LEFT,
+                                        wraplength=200)
         self._color_hint_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self._btn(crow, "Отправить заново", self._on_resend_colors, width=130,
-                  height=28).pack(side=tk.RIGHT)
+        self._btn(crow, "Отправить заново", self._on_resend_colors, width=140,
+                  height=30).pack(side=tk.RIGHT)
 
         # === 8. Кнопки действий ===
         # Именованный: блоки вкладок пакуются динамически ПОЗЖЕ, а pack без
@@ -982,6 +1160,91 @@ class App:
                       fg_color="transparent", hover_color=theme.DANGER_DARK,
                       text_color=theme.DANGER, font=theme.C_TINY, height=24,
                       width=10).pack(anchor="e", pady=(6, 0))
+
+    def _segmented(self, parent, values, command):
+        return ctk.CTkSegmentedButton(
+            parent, values=values, command=command, font=theme.C_SMALL, height=32,
+            fg_color=theme.SURFACE_2, unselected_color=theme.SURFACE_2,
+            unselected_hover_color=theme.SURFACE_3, selected_color=theme.SEG_ON,
+            selected_hover_color=theme.SEG_ON_HOVER, text_color=theme.SEG_TEXT,
+            corner_radius=theme.RADIUS_SM)
+
+    # ── Палитра: заводские цвета + свои ───────────────────────────────────────
+    def _custom_colors(self):
+        return [c for c in appconfig.config.get("custom_colors", [])
+                if isinstance(c, str) and c.startswith("#") and len(c) == 7]
+
+    def _build_palette(self):
+        pal = self._palette
+        for w in pal.winfo_children():
+            w.destroy()
+        self._color_preset_btns = []
+        cols = 8
+        for c in range(cols):
+            # ровная сетка: кружок с обводкой шире и раздвигал свою колонку
+            pal.grid_columnconfigure(c, minsize=34, uniform="pal")
+        items =[(c, False) for c in COLOR_PRESETS] + [(c, True) for c in self._custom_colors()]
+        for i, (hex_c, custom) in enumerate(items):
+            # Кружок, чей цвет сливается с карточкой (чёрный в тёмной теме,
+            # белый в светлой), получает обводку — иначе его не видно.
+            r, g, b = (int(hex_c[i:i + 2], 16) for i in (1, 3, 5))
+            lum = 0.299 * r + 0.587 * g + 0.114 * b
+            edge = lum < 20 if theme.applied == "dark" else lum > 200
+            btn = ctk.CTkButton(pal, text="", width=28, height=28, corner_radius=14,
+                                fg_color=hex_c, hover_color=hex_c,
+                                border_width=2 if edge else 0,
+                                border_color=theme.BORDER,
+                                command=lambda c=hex_c: self._apply_color(c))
+            btn.grid(row=i // cols, column=i % cols, padx=3, pady=3)
+            self._color_preset_btns.append((hex_c, btn))
+            if custom:
+                btn.bind("<Button-3>", lambda e, c=hex_c: self._palette_menu(e, c))
+                ToolTip(btn, lambda c=hex_c: f"{c} — свой цвет. Правый клик — убрать.")
+        # Свой цвет — такой же кружок: широкая кнопка раздвигала колонку сетки
+        i = len(items)
+        # Canvas, \u0430 \u043d\u0435 CTkButton: \u0443 \u043a\u043d\u043e\u043f\u043a\u0438 \u0441 \u0442\u0435\u043a\u0441\u0442\u043e\u043c CTk \u0434\u0435\u0440\u0436\u0438\u0442 \u043c\u0438\u043d\u0438\u043c\u0430\u043b\u044c\u043d\u0443\u044e
+        # \u0448\u0438\u0440\u0438\u043d\u0443 \u043f\u043e\u0434 \u043d\u0430\u0434\u043f\u0438\u0441\u044c, \u0438 \u00ab+\u00bb \u0432\u044b\u0445\u043e\u0434\u0438\u043b \u043e\u0432\u0430\u043b\u043e\u043c, \u0440\u0430\u0437\u0434\u0432\u0438\u0433\u0430\u044f \u0441\u0435\u0442\u043a\u0443.
+        custom = tk.Canvas(pal, width=28, height=28, bg=theme.SURFACE,
+                           highlightthickness=0, cursor="hand2")
+
+        def draw_plus(fill):
+            custom.delete("all")
+            custom.create_oval(1, 1, 27, 27, fill=fill, outline=theme.BORDER)
+            custom.create_text(14, 14, text="\ue710", fill=theme.MUTED,
+                               font=(theme.ICON_FONT, 9))
+        draw_plus(theme.SURFACE_2)
+        custom.bind("<Enter>", lambda e: draw_plus(theme.SURFACE_3))
+        custom.bind("<Leave>", lambda e: draw_plus(theme.SURFACE_2))
+        custom.bind("<Button-1>", lambda e: self._pick_custom_color())
+        custom.grid(row=i // cols, column=i % cols, padx=3, pady=3)
+        ToolTip(custom, lambda: "Добавить свой цвет")
+
+    def _palette_menu(self, event, hex_c):
+        m = dialogs.PopupMenu(self.root, width=220)
+        m.item("Убрать из палитры", lambda: self._remove_custom_color(hex_c), "\ue74d")
+        m.win.update_idletasks()
+        m.win.geometry(f"+{event.x_root}+{event.y_root}")
+        m.win.deiconify()
+        m.win.lift()
+        m.win.focus_force()
+        m._born = True
+        self.root.after(80, lambda: setattr(m, "_born", False))
+
+    def _add_custom_color(self, hex_c):
+        hex_c = hex_c.lower()
+        if hex_c in COLOR_PRESETS:
+            return
+        cur = [c for c in self._custom_colors() if c.lower() != hex_c]
+        cur.append(hex_c)
+        appconfig.config["custom_colors"] = cur[-appconfig.MAX_CUSTOM_COLORS:]
+        self._save_config()
+        self._build_palette()
+
+    def _remove_custom_color(self, hex_c):
+        appconfig.config["custom_colors"] = [
+            c for c in self._custom_colors() if c.lower() != hex_c.lower()]
+        self._save_config()
+        self._build_palette()
 
     def _show_tab(self, name):
         """Вкладка пэда. Для крутилок и кнопок видна всегда «Действие»."""
@@ -1286,10 +1549,11 @@ class App:
 
     # ── Color area ────────────────────────────────────────────────────────────
     def _update_color_hint(self):
+        # Молчит, пока всё в порядке. Пока устройство не подключено, канал
+        # цвета ещё неизвестен — это тоже не проблема, о которой стоит писать.
+        bad = self._color_known and not self._color_ok
         self._color_hint_lbl.config(
-            text="цвет уходит на пэд сразу" if self._color_ok
-                 else "устройство цвет не принимает — только экран",
-            fg="#8c8" if self._color_ok else "#c88")
+            text="Устройство не принимает цвет — он виден только на экране." if bad else "")
 
     def _apply_color(self, hex_col, keep_base=False):
         if not self.current_sel:
@@ -1318,9 +1582,11 @@ class App:
         ble.set_pad_color(int(self.current_sel.split("_")[1]), final)
 
     def _pick_custom_color(self):
-        result = colorchooser.askcolor(title="Выберите цвет")
-        if result and result[1]:
-            self._apply_color(result[1])
+        start = self._color_base or DEFAULT_PAD_COLOR
+        result = dialogs.pick_color(self.root, start)
+        if result:
+            self._add_custom_color(result)
+            self._apply_color(result)
 
     def _on_color_hex_commit(self, event=None):
         val = self._color_hex_var.get().strip()
@@ -1434,7 +1700,7 @@ class App:
 
         if self._learn_uid == uid:
             self._learn_lbl.config(text="нажмите контрол на устройстве…",
-                                   fg="#ffaa00")
+                                   fg=theme.WARN)
             self._learn_btn.configure(text="Отмена", fg_color=theme.WARN,
                                       hover_color=theme.WARN, text_color="#1a1300")
             self._learn_banner.config(
@@ -1447,18 +1713,14 @@ class App:
         el = self.ui_elements[uid]
         mid = el.get("midi_id")
         if mid is None:
-            # BT / PAD BNK / KNOB BNK — служебные кнопки самого устройства.
-            # Они переключают банк и блютус на железе и по MIDI обычно молчат,
-            # так что «Привязать» на них может не поймать ничего.
-            text = ("не привязан — служебная кнопка устройства"
-                    if uid in ("btn_1", "btn_2", "btn_3") else "не привязан")
-            self._learn_lbl.config(text=text, fg="#cc8888")
+            text = "не привязан"
+            self._learn_lbl.config(text=text, fg=theme.MUTED)
             return
         kind = el.get("midi_kind")
         if kind is None:
             kind = "note" if el["type"] == "pad" else "cc"
         self._learn_lbl.config(text=f"{'CC' if kind == 'cc' else 'нота'} {mid}",
-                               fg="#88cc88")
+                               fg=theme.OK)
 
     # ── Identify mode ─────────────────────────────────────────────────────────
     def _on_identify_toggle(self):
@@ -1488,7 +1750,7 @@ class App:
         elif el["type"] == "knob":
             name = f"КРУТИЛКА {num}"
         else:
-            name = f"КНОПКА {num}"
+            name = f"КНОПКА  {el.get('icon', num)}"
         self._insp_header.config(text=name)
 
         # Show content area
@@ -1562,32 +1824,20 @@ class App:
     #  HOTKEY RECORDING
     # ══════════════════════════════════════════════════════════════════════════
     def record_hotkey(self):
-        dlg = tk.Toplevel(self.root)
-        dlg.title("Назначение Хоткея")
-        dlg.geometry("350x150")
-        dlg.configure(bg="#2d2d30")
-        dlg.transient(self.root)
-        dlg.grab_set()
-        tk.Label(dlg, text="Нажмите нужную комбинацию на клавиатуре",
-                 bg="#2d2d30", fg="white", pady=15, font=("Segoe UI", 10)).pack()
-        lbl = tk.Label(dlg, text="Ожидание...", font=("Segoe UI", 16, "bold"),
-                       fg="#ffaa00", bg="#2d2d30")
-        lbl.pack(pady=10)
-
-        tk.Button(dlg, text="Отмена", command=dlg.destroy, bg="#444", fg="#fff",
-                  bd=0, padx=10, font=("Segoe UI", 9)).pack()
-
-        # Окну нужен фокус клавиатуры явно. grab_set() перехватывает только
-        # мышь; нажатия шли в главное окно, пока пользователь не переключался
-        # на другое окно и обратно. after — потому что на Windows фокус,
-        # выданный до первой отрисовки, окно теряет.
-        dlg.update_idletasks()
-        x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
-        y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 3
-        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-        dlg.lift()
-        dlg.focus_force()
-        dlg.after(50, dlg.focus_force)
+        m = dialogs.Modal(self.root, "Своя комбинация", width=380)
+        dialogs.label(m.body, "Нажмите нужную комбинацию на клавиатуре.",
+                      fg=theme.MUTED, font=theme.F_BODY, anchor="w").pack(
+            fill=tk.X, pady=(8, 0))
+        lbl = tk.Label(m.body, text="Ожидание", font=(theme.FONT, 16, "bold"),
+                       fg=theme.WARN, bg=theme.ELEVATED)
+        lbl.pack(pady=(16, 4))
+        m.buttons([("Отмена", None, "secondary")])
+        dlg = m.win
+        # Окну нужен фокус клавиатуры явно — Modal.show выдаёт его дважды:
+        # grab_set() перехватывает только мышь, а фокус, выданный до первой
+        # отрисовки, окно на Windows теряет (FIXES, запись со второго раза).
+        # Esc закрывает окно (привязка Modal точнее, чем <KeyPress>), поэтому
+        # одиночный Esc хоткеем не записать; Ctrl+Esc и прочие — можно.
 
         recorded = []
         def on_key(e):
@@ -1598,13 +1848,13 @@ class App:
                 return
 
             hotkey_str = "+".join(mods + [key])
-            lbl.config(text=_format_hotkey(hotkey_str), fg="#00ff00")
+            lbl.config(text=_format_hotkey(hotkey_str), fg=theme.OK)
             recorded.append(hotkey_str)
             dlg.unbind("<KeyPress>")
-            dlg.after(500, dlg.destroy)
+            dlg.after(500, lambda: m.close(hotkey_str))
 
         dlg.bind("<KeyPress>", on_key)
-        self.root.wait_window(dlg)
+        m.show()
         return recorded[0] if recorded else None
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1629,10 +1879,11 @@ class App:
         self.update_ui_from_config()
 
     def clear_all(self):
-        if messagebox.askyesno(
-                "Сброс",
-                "Удалить назначения ВСЕХ элементов?\n\n"
-                "Привязки к MIDI (какая кнопка какой контрол) сохранятся."):
+        if dialogs.confirm(
+                self.root, "Сбросить все назначения?",
+                "Действия и цвета всех элементов будут удалены. Привязки к MIDI "
+                "(какая кнопка какой контрол) сохранятся. Можно заранее сохранить "
+                "пресет.", ok_text="Сбросить", danger=True):
             bindings = appconfig.config["bindings"]
             for uid in list(bindings):
                 bindings[uid] = self._keep_hardware(bindings[uid])
@@ -1667,7 +1918,7 @@ class App:
                 # иначе после назначения не понять, какая это кнопка.
                 el["lbl"].config(text=_ellipsize(
                                      display.replace("+\n", "+").replace("\n", " "), 17),
-                                 fg="#0f0" if display else "#666")
+                                 fg=theme.OK if display else theme.DIM)
             elif el["type"] == "knob":
                 mode = data.get("mode", "delta")
                 if mode == "pair":
@@ -1679,10 +1930,10 @@ class App:
                     if cw and cw.id != "none":
                         parts.append(f"▶{cw.short}")
                     el["lbl"].config(text=" ".join(parts)[:12] if parts else "",
-                                     fg="#0f0" if parts else "#aaa")
+                                     fg=theme.OK if parts else theme.MUTED)
                 else:
                     el["lbl"].config(text=display[:10],
-                                     fg="#0f0" if display else "#aaa")
+                                     fg=theme.OK if display else theme.MUTED)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  HARDWARE MAPPING
@@ -2023,9 +2274,7 @@ class App:
 
             elif msg.startswith("color:"):
                 self._color_ok = msg.split(":", 1)[1] == "есть"
-                self._color_status_var.set(
-                    "цвет: идёт на устройство" if self._color_ok
-                    else "цвет: только на экране")
+                self._color_known = True
                 self._update_color_hint()
 
             elif msg.startswith("state:"):

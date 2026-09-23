@@ -17,7 +17,9 @@ import PyInstaller.__main__
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 WORK = os.path.join(tempfile.gettempdir(), "smc-pad-build")
-OUT = os.path.join(ROOT, "release")
+# Папку можно передать аргументом: пока старый exe запущен, его файл занят,
+# и сборка поверх него падает — тогда собираем рядом и меняем после выхода.
+OUT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(ROOT, "release")
 
 PyInstaller.__main__.run([
     os.path.join(ROOT, "midi_gui.py"),
