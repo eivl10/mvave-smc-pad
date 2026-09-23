@@ -12,6 +12,9 @@ from mvave import actions
 from mvave import appconfig
 from mvave import volume_osd
 from mvave import tray
+from mvave import theme
+
+import customtkinter as ctk
 
 # ── Bank map: bank number → MIDI note base for PAD 1 ─────────────────────────
 # Bank 3 is the factory default (notes 36-51).
@@ -179,6 +182,11 @@ def _key_from_event(e):
             "escape": "esc"}.get(keysym, keysym)
 
 
+def _ellipsize(text, n):
+    """Обрезать с «…»: подпись, срезанная краем рамки, читается как другая."""
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
 def _element_display_text(binding):
     """Build short label for a pad/knob/button from its binding dict."""
     if not binding:
@@ -292,8 +300,9 @@ class ToolTip:
         x = self._widget.winfo_rootx() + 20
         y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
         tw.wm_geometry(f"+{x}+{y}")
-        lbl = tk.Label(tw, text=text, bg="#ffffe0", fg="#000", font=("Segoe UI", 9),
-                       relief=tk.SOLID, bd=1, padx=6, pady=3, justify=tk.LEFT)
+        lbl = tk.Label(tw, text=text, bg=theme.SURFACE_3, fg=theme.TEXT,
+                       font=theme.F_SMALL, relief=tk.FLAT, bd=0, padx=10, pady=6,
+                       justify=tk.LEFT, wraplength=320)
         lbl.pack()
         self._tw = tw
 
@@ -309,7 +318,8 @@ class App:
         self.root = root
         self._last_note_time = {}  # uid -> float
         self.root.title("M-Vave SMC-PAD Controller")
-        self.root.geometry("1200x700")
+        self.root.geometry("1320x780")
+        self.root.minsize(1180, 700)
         self.root.configure(bg="#111")
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mvave_icon.ico")
         if os.path.exists(icon_path):
@@ -353,10 +363,8 @@ class App:
         actions.set_clipboard_provider(_TkClipboard(root))
         actions.set_pad_brightness_provider(self._nudge_pad_brightness)
 
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure("TCombobox", fieldbackground="white", background="#eee",
-                         foreground="black", bordercolor="#aaa")
+        theme.apply_ttk(self.root)
+        ctk.set_appearance_mode("dark")
 
         self.build_ui()
 
@@ -373,82 +381,129 @@ class App:
     # ══════════════════════════════════════════════════════════════════════════
     #  BUILD UI
     # ══════════════════════════════════════════════════════════════════════════
+    # Правило вёрстки: CTk-виджеты — там, где их не перекрашивает код
+    # (кнопки, поля, ползунки, переключатели). Метки, которым код на ходу
+    # меняет fg/bg, остаются tk.Label: у CTk другие имена параметров, а его
+    # .config() уходит во внутреннюю рамку, и вызов ломается молча.
+    def _card(self, parent, **grid_or_pack):
+        """Скруглённая карточка + внутренняя tk-рамка цвета карточки."""
+        card = ctk.CTkFrame(parent, fg_color=theme.SURFACE,
+                            corner_radius=theme.RADIUS, border_width=0)
+        inner = tk.Frame(card, bg=theme.SURFACE)
+        inner.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+        return card, inner
+
+    def _lbl(self, parent, text="", fg=theme.TEXT, font=theme.F_SMALL, **kw):
+        return tk.Label(parent, text=text, fg=fg, bg=parent.cget("bg"),
+                        font=font, **kw)
+
+    def _btn(self, parent, text, command, kind="secondary", **kw):
+        colors = {
+            "primary": (theme.ACCENT, theme.ACCENT_HOVER, "#ffffff"),
+            "secondary": (theme.SURFACE_2, theme.SURFACE_3, theme.TEXT),
+            "success": (theme.OK_DARK, "#24503a", "#b8f5cf"),
+            "danger": (theme.DANGER_DARK, "#512730", "#ffb4b4"),
+        }[kind]
+        kw.setdefault("height", 30)
+        kw.setdefault("corner_radius", theme.RADIUS_SM)
+        return ctk.CTkButton(parent, text=text, command=command,
+                             fg_color=colors[0], hover_color=colors[1],
+                             text_color=colors[2], font=theme.C_SMALL, **kw)
+
     def build_ui(self):
-        # ── Header ────────────────────────────────────────────────────────────
-        header = tk.Frame(self.root, bg="#1a1a1a", pady=5)
-        header.pack(fill=tk.X)
+        self.root.configure(bg=theme.BG)
+
+        # ── Шапка: состояние устройства + общие настройки ────────────────────
+        head_card, header = self._card(self.root)
+        head_card.pack(fill=tk.X, padx=12, pady=(12, 6))
+
+        row1 = tk.Frame(header, bg=theme.SURFACE)
+        row1.pack(fill=tk.X)
+
+        self._status_dot = tk.Canvas(row1, width=12, height=12, bg=theme.SURFACE,
+                                     highlightthickness=0)
+        self._status_dot.pack(side=tk.LEFT, padx=(0, 6))
         self.status_var = tk.StringVar(value="Подключение...")
-        tk.Label(header, textvariable=self.status_var, fg="#00ff00", bg="#1a1a1a",
-                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=20)
+        self._lbl(row1, fg=theme.TEXT, font=theme.F_BOLD,
+                  textvariable=self.status_var).pack(side=tk.LEFT)
+        self.status_var.trace_add("write", lambda *a: self._draw_status_dot())
+        self._draw_status_dot()
 
-        # Bank display
+        # Заряд. Значок рисуется на Canvas: эмодзи батареи Tk на Windows
+        # показывает пустым квадратом (FIXES, «эмодзи в Tkinter не рисуются»).
+        self._battery_pct = None
+        self._battery_canvas = tk.Canvas(row1, width=28, height=14, bg=theme.SURFACE,
+                                         highlightthickness=0)
+        self._battery_canvas.pack(side=tk.LEFT, padx=(18, 5))
+        self._battery_lbl = self._lbl(row1, "—", fg=theme.MUTED, font=theme.F_SMALL)
+        self._battery_lbl.pack(side=tk.LEFT)
+        self._draw_battery()
+
         self._bank_var = tk.StringVar(value="Банк 3")
-        tk.Label(header, textvariable=self._bank_var, fg="#ffaa00", bg="#1a1a1a",
-                 font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=10)
+        tk.Label(row1, textvariable=self._bank_var, fg=theme.WARN, bg=theme.SURFACE_2,
+                 font=theme.F_SMALL, padx=10, pady=2).pack(side=tk.LEFT, padx=(18, 0))
 
-        # Config error display
         if appconfig.last_error:
-            tk.Label(header, text=f"⚠ {appconfig.last_error}", fg="#ff4444",
-                     bg="#1a1a1a", font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=10)
+            self._lbl(row1, f"⚠ {appconfig.last_error}", fg=theme.DANGER).pack(
+                side=tk.LEFT, padx=10)
 
-        # Identify mode checkbox
         self._identify_var = tk.BooleanVar(value=False)
-        ident_cb = tk.Checkbutton(header, text="Определить", variable=self._identify_var,
-                                   command=self._on_identify_toggle,
-                                   bg="#1a1a1a", fg="#aaa", selectcolor="#333",
-                                   activebackground="#1a1a1a", activeforeground="#fff",
-                                   font=("Segoe UI", 9))
-        ident_cb.pack(side=tk.LEFT, padx=15)
+        ctk.CTkSwitch(row1, text="Определить", variable=self._identify_var,
+                      onvalue=True, offvalue=False, command=self._on_identify_toggle,
+                      font=theme.C_SMALL, text_color=theme.MUTED,
+                      progress_color=theme.ACCENT, button_color=theme.TEXT,
+                      fg_color=theme.SURFACE_3, switch_width=34, switch_height=18,
+                      width=110).pack(side=tk.LEFT, padx=(18, 0))
 
         # Пока ждём сигнал для привязки — это видно в шапке, а не только
         # мелкой строкой в инспекторе.
-        self._learn_banner = tk.Label(header, text="", fg="#000", bg="#ffaa00",
-                                       font=("Segoe UI", 9, "bold"), padx=8)
+        self._learn_banner = tk.Label(row1, text="", fg="#1a1300", bg=theme.WARN,
+                                      font=theme.F_SMALL + ("bold",), padx=10, pady=2)
+
+        self._settings_btn = self._btn(row1, "Настройки  ▾", self._open_settings_menu,
+                                       width=120)
+        self._settings_btn.pack(side=tk.RIGHT)
 
         self.last_input_var = tk.StringVar(value="")
-        tk.Label(header, textvariable=self.last_input_var, fg="#00c8ff", bg="#1a1a1a",
-                 font=("Segoe UI", 10)).pack(side=tk.RIGHT, padx=20)
+        self._lbl(row1, fg=theme.ACCENT, font=theme.F_SMALL,
+                  textvariable=self.last_input_var).pack(side=tk.RIGHT, padx=(0, 16))
 
         # Цвет уходит на устройство по отдельному вендорскому каналу. Если его
         # нет — цвет останется только на экране, и об этом надо сказать вслух.
         self._color_status_var = tk.StringVar(value="цвет: ждём устройство")
-        tk.Label(header, textvariable=self._color_status_var, fg="#888",
-                 bg="#1a1a1a", font=("Segoe UI", 9)).pack(side=tk.RIGHT, padx=10)
+        self._lbl(row1, fg=theme.DIM, font=theme.F_TINY,
+                  textvariable=self._color_status_var).pack(side=tk.RIGHT, padx=(0, 16))
 
-        # ── Main area: device left, inspector right ───────────────────────────
-        # ── Полоса общей яркости подсветки ──────────────────────────────────
+        # ── Общая яркость подсветки ──────────────────────────────────────────
         # Один фейдер на все 16 пэдов. Яркость конкретного пэда остаётся
         # частью его цвета, это живой множитель поверх неё.
-        dim = tk.Frame(self.root, bg="#151515", pady=4)
-        dim.pack(fill=tk.X)
-        tk.Label(dim, text="Яркость пэдов", fg="#aaa", bg="#151515",
-                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(20, 8))
+        row2 = tk.Frame(header, bg=theme.SURFACE)
+        row2.pack(fill=tk.X, pady=(10, 0))
+        self._lbl(row2, "Яркость пэдов", fg=theme.MUTED).pack(side=tk.LEFT, padx=(0, 10))
         self._pad_dim_var = tk.IntVar(
             value=int(appconfig.config.get("pad_brightness", 100)))
-        self._pad_dim_scale = tk.Scale(
-            dim, from_=0, to=100, orient=tk.HORIZONTAL,
-            variable=self._pad_dim_var, showvalue=False,
-            bg="#151515", fg="#aaa", troughcolor="#333", bd=0,
-            highlightthickness=0, length=320, sliderlength=18,
-            activebackground="#00c8ff", command=self._on_pad_dim_change)
+        self._pad_dim_scale = ctk.CTkSlider(
+            row2, from_=0, to=100, number_of_steps=100, variable=self._pad_dim_var,
+            command=self._on_pad_dim_change, width=300, height=16,
+            progress_color=theme.ACCENT, button_color=theme.TEXT,
+            button_hover_color="#ffffff", fg_color=theme.SURFACE_3)
         self._pad_dim_scale.pack(side=tk.LEFT)
-        self._pad_dim_lbl = tk.Label(dim, text="", fg="#00c8ff", bg="#151515",
-                                      font=("Segoe UI", 9, "bold"), width=5)
+        self._pad_dim_lbl = self._lbl(row2, "", fg=theme.TEXT, font=theme.F_BOLD, width=5)
         self._pad_dim_lbl.pack(side=tk.LEFT, padx=(8, 0))
         self._pad_dim_lbl.config(text=f"{self._pad_dim_var.get()}%")
-        tk.Label(dim, text="крутилкой: Подсветка → Яркость пэдов",
-                 fg="#666", bg="#151515",
-                 font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=20)
+        self._lbl(row2, "можно и крутилкой: Подсветка → Яркость пэдов",
+                  fg=theme.DIM, font=theme.F_TINY).pack(side=tk.LEFT, padx=16)
 
-        main_area = tk.Frame(self.root, bg="#111")
-        main_area.pack(fill=tk.BOTH, expand=True)
+        # ── Основная область: схема слева, панель справа ─────────────────────
+        main_area = tk.Frame(self.root, bg=theme.BG)
+        main_area.pack(fill=tk.BOTH, expand=True, padx=12, pady=(6, 12))
         main_area.columnconfigure(0, weight=1)
         main_area.columnconfigure(1, weight=0)
         main_area.rowconfigure(0, weight=1)
 
-        device_frame = tk.Frame(main_area, bg="#1a1a1a", bd=2, relief=tk.RAISED,
-                                padx=15, pady=10)
-        device_frame.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
+        dev_card, device_frame = self._card(main_area)
+        dev_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        S = theme.SURFACE
 
         # Схема — блок фиксированного размера. Без распорок по краям он липнет
         # в левый верхний угол, и справа от кнопок остаётся пустая половина
@@ -460,25 +515,25 @@ class App:
         device_frame.rowconfigure(2, weight=1)
 
         # ── KNOBS: left side (4 rows × 2 cols, matches physical device) ──────
-        knob_frame = tk.Frame(device_frame, bg="#1a1a1a")
+        knob_frame = tk.Frame(device_frame, bg=S)
         knob_frame.grid(row=1, column=1, padx=(0, 10), sticky="ns")
 
         for num in range(1, 9):
             uid = f"knob_{num}"
             grid_row = 3 - (num - 1) // 2   # 1,2→row3; 3,4→row2; 5,6→row1; 7,8→row0
             grid_col = (num - 1) % 2          # odd→col0, even→col1
-            f = tk.Frame(knob_frame, bg="#1a1a1a")
+            f = tk.Frame(knob_frame, bg=S)
             f.grid(row=grid_row, column=grid_col, padx=6, pady=6)
 
-            lbl_num = tk.Label(f, text=str(num), fg="#666", bg="#1a1a1a",
-                               font=("Segoe UI", 8))
+            lbl_num = tk.Label(f, text=str(num), fg=theme.DIM, bg=S,
+                               font=theme.F_TINY)
             lbl_num.pack()
 
-            knob_canvas = UIKnob(f, size=48, bg_col="#1a1a1a")
+            knob_canvas = UIKnob(f, size=48, bg_col=S)
             knob_canvas.pack(pady=1)
 
-            lbl_act = tk.Label(f, text="", fg="#aaa", bg="#1a1a1a",
-                               font=("Segoe UI", 7))
+            lbl_act = tk.Label(f, text="", fg=theme.MUTED, bg=S,
+                               font=(theme.FONT, 7))
             lbl_act.pack()
 
             self.ui_elements[uid] = {"frame": f, "lbl": lbl_act, "num": lbl_num,
@@ -487,7 +542,7 @@ class App:
             self._attach_tooltip(f, uid)
 
         # ── PADS: standard MPC layout — PAD1 bottom-left, PAD16 top-right ────
-        center_panel = tk.Frame(device_frame, bg="#1a1a1a")
+        center_panel = tk.Frame(device_frame, bg=S)
         center_panel.grid(row=1, column=2, padx=10, pady=5)
 
         for num in range(1, 17):
@@ -495,17 +550,17 @@ class App:
             # MPC grid: row 3=bottom(PAD1-4), row 0=top(PAD13-16)
             grid_row = 3 - (num - 1) // 4
             grid_col = (num - 1) % 4
-            outer = tk.Frame(center_panel, bg="#000", padx=2, pady=2)
-            outer.grid(row=grid_row, column=grid_col, padx=5, pady=5)
-            f = tk.Frame(outer, width=100, height=100, bg="#222")
+            outer = tk.Frame(center_panel, bg=S, padx=2, pady=2)
+            outer.grid(row=grid_row, column=grid_col, padx=4, pady=4)
+            f = tk.Frame(outer, width=94, height=94, bg="#222")
             f.pack()
             f.pack_propagate(False)
 
             lbl_num = tk.Label(f, text=f"PAD{num}", fg="#777", bg="#222",
-                               font=("Segoe UI", 7, "bold"))
-            lbl_num.pack(anchor="nw", padx=3, pady=2)
+                               font=(theme.FONT, 7, "bold"))
+            lbl_num.pack(anchor="nw", padx=4, pady=3)
             lbl_act = tk.Label(f, text="", fg="white", bg="#222",
-                               font=("Segoe UI", 9, "bold"), wraplength=92)
+                               font=(theme.FONT, 9, "bold"), wraplength=86)
             lbl_act.pack(expand=True)
 
             self.ui_elements[uid] = {"outer": outer, "frame": f, "lbl": lbl_act,
@@ -514,8 +569,8 @@ class App:
             self._attach_tooltip(outer, uid)
 
         # ── BUTTONS: vertical column on right (matches physical device) ───────
-        btn_panel = tk.Frame(device_frame, bg="#1a1a1a")
-        btn_panel.grid(row=1, column=3, padx=(10, 0), sticky="n", pady=(15, 0))
+        btn_panel = tk.Frame(device_frame, bg=S)
+        btn_panel.grid(row=1, column=3, padx=(10, 0), sticky="n", pady=(8, 0))
 
         btn_defs = [
             ("BT",       "#003355", "#8cf", 8),
@@ -531,9 +586,12 @@ class App:
         ]
         for num, (icon, bg, fg, fsize) in enumerate(btn_defs, 1):
             uid = f"btn_{num}"
-            outer = tk.Frame(btn_panel, bg="#000", padx=1, pady=1)
+            outer = tk.Frame(btn_panel, bg=S, padx=1, pady=1)
             outer.pack(pady=2)
-            f = tk.Frame(outer, width=160, height=34, bg=bg)
+            # Ширину держит рамка, а подпись действия режется с «…» в
+            # update_ui_from_config: раньше значок занимал 8 символов, и
+            # подпись обрезалась краем панели («◀ Тре», «Pl»).
+            f = tk.Frame(outer, width=172, height=34, bg=bg)
             f.pack()
             f.pack_propagate(False)
 
@@ -541,14 +599,14 @@ class App:
             # действия затирала значок, и понять, какая это физическая кнопка,
             # было уже нельзя.
             lbl_num = tk.Label(f, text=str(num), fg="#888", bg=bg,
-                               font=("Segoe UI", 7))
-            lbl_num.pack(side=tk.LEFT, padx=(5, 3))
-            lbl_icon = tk.Label(f, text=icon, fg=fg, bg=bg, width=8, anchor="w",
-                                font=("Segoe UI", fsize, "bold"))
+                               font=(theme.FONT, 7))
+            lbl_num.pack(side=tk.LEFT, padx=(6, 3))
+            lbl_icon = tk.Label(f, text=icon, fg=fg, bg=bg, anchor="w",
+                                font=(theme.FONT, fsize, "bold"))
             lbl_icon.pack(side=tk.LEFT)
             lbl_act = tk.Label(f, text="", fg="#0f0", bg=bg, anchor="e",
-                               font=("Segoe UI", 8))
-            lbl_act.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(3, 6))
+                               font=theme.F_TINY)
+            lbl_act.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(3, 8))
 
             self.ui_elements[uid] = {"outer": outer, "frame": f, "lbl": lbl_act,
                                      "num": lbl_num, "icon_lbl": lbl_icon,
@@ -556,6 +614,26 @@ class App:
                                      "midi_kind": None, "icon": icon}
             self.bind_click(outer, uid, f, lbl_num, lbl_icon, lbl_act)
             self._attach_tooltip(outer, uid)
+
+        # Shift и Note Repeat в эфир не шлют ничего — замер 2026-09-23,
+        # docs/PROTOCOL.md §1. Показаны, чтобы схема совпадала с корпусом,
+        # но выбрать их нельзя: назначить действие не на что.
+        tk.Label(btn_panel, text="обрабатывает сам контроллер", fg=theme.DIM, bg=S,
+                 font=(theme.FONT, 7)).pack(anchor="w", pady=(8, 1))
+        fw_tip = ("Эту кнопку обрабатывает прошивка контроллера (Shift+пэд — "
+                  "пресеты, чувствительность, октава). В компьютер она "
+                  "ничего не передаёт, поэтому назначить на неё действие нельзя.")
+        for icon in ("SHIFT", "NOTE RPT"):
+            outer = tk.Frame(btn_panel, bg=S, padx=1, pady=1)
+            outer.pack(pady=2)
+            f = tk.Frame(outer, width=172, height=30, bg=theme.SURFACE_2)
+            f.pack()
+            f.pack_propagate(False)
+            tk.Label(f, text=icon, fg=theme.DIM, bg=theme.SURFACE_2, anchor="w",
+                     font=(theme.FONT, 8, "bold")).pack(side=tk.LEFT, padx=(18, 0))
+            tk.Label(f, text="прошивка", fg=theme.DIM, bg=theme.SURFACE_2, anchor="e",
+                     font=(theme.FONT, 7)).pack(side=tk.RIGHT, padx=8)
+            ToolTip(outer, lambda: fw_tip)
 
         # ── RIGHT INSPECTOR PANEL ─────────────────────────────────────────────
         self._build_inspector(main_area)
@@ -571,227 +649,353 @@ class App:
         self.root.bind("<Control-d>", self._toggle_debug)
         self.root.bind("<Control-D>", self._toggle_debug)
 
+    # ── Индикаторы шапки ──────────────────────────────────────────────────────
+    def _draw_status_dot(self):
+        s = self.status_var.get().lower()
+        if "подключено" in s:
+            col = theme.OK
+        elif "не найден" in s or "ошибка" in s:
+            col = theme.DANGER
+        else:
+            col = theme.WARN
+        c = self._status_dot
+        c.delete("all")
+        c.create_oval(2, 2, 11, 11, fill=col, outline="")
+
+    def _draw_battery(self):
+        pct = self._battery_pct
+        c = self._battery_canvas
+        c.delete("all")
+        if pct is None:
+            col = theme.DIM
+        elif pct <= 20:
+            col = theme.WARN
+        else:
+            col = theme.TEXT
+        c.create_rectangle(1, 1, 24, 13, outline=col, width=1.5)
+        c.create_rectangle(25, 5, 27, 9, fill=col, outline="")
+        if pct is not None:
+            w = max(1, round(20 * pct / 100))
+            c.create_rectangle(3.5, 3.5, 3.5 + w, 10.5,
+                               fill=theme.WARN if pct <= 20 else theme.OK, outline="")
+        self._battery_lbl.config(text="—" if pct is None else f"{pct}%",
+                                 fg=theme.MUTED if pct is None else col)
+
+    def _set_battery(self, pct):
+        self._battery_pct = pct if 0 <= pct <= 100 else None
+        self._draw_battery()
+
+    # ── Меню «Настройки»: перенос на другой компьютер ────────────────────────
+    def _open_settings_menu(self):
+        m = tk.Menu(self.root, tearoff=False, bg=theme.SURFACE_2, fg=theme.TEXT,
+                    activebackground=theme.ACCENT, activeforeground="#ffffff",
+                    bd=0, font=theme.F_SMALL)
+        m.add_command(label="Сохранить настройки в файл…", command=self._on_export)
+        m.add_command(label="Загрузить настройки из файла…", command=self._on_import)
+        m.add_separator()
+        m.add_command(label="Открыть папку с настройками", command=self._on_open_config_dir)
+        b = self._settings_btn
+        m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height() + 4)
+
+    def _on_export(self):
+        name = time.strftime("smc-pad-настройки-%Y-%m-%d.json")
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Сохранить настройки", initialfile=name,
+            defaultextension=".json", filetypes=[("Настройки SMC-PAD", "*.json")])
+        if not path:
+            return
+        try:
+            appconfig.export_config(path)
+        except OSError as e:
+            messagebox.showerror("Настройки не сохранены", str(e), parent=self.root)
+            return
+        messagebox.showinfo(
+            "Настройки сохранены",
+            f"{path}\n\nНа другом компьютере: Настройки → «Загрузить настройки "
+            f"из файла…». Адрес контроллера в файл не попадает — там он "
+            f"найдётся сам.", parent=self.root)
+
+    def _on_import(self):
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Загрузить настройки",
+            filetypes=[("Настройки SMC-PAD", "*.json"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        if not messagebox.askyesno(
+                "Заменить настройки?",
+                "Все назначения, цвета и яркость заменятся настройками из файла.\n"
+                "Текущие сохранятся рядом отдельным файлом — к ним можно вернуться "
+                "тем же пунктом меню.", parent=self.root):
+            return
+        ok, report = appconfig.import_config(path)
+        if not ok:
+            messagebox.showerror("Настройки не загружены", report, parent=self.root)
+            return
+        self._pad_dim_var.set(int(appconfig.config.get("pad_brightness", 100)))
+        self._pad_dim_lbl.config(text=f"{self._pad_dim_var.get()}%")
+        self.load_hardware_mapping()
+        self.update_ui_from_config()
+        if self.current_sel:
+            self.select_element(self.current_sel)
+        self._on_resend_colors()
+        show = messagebox.showwarning if "не найдены" in report else messagebox.showinfo
+        show("Настройки загружены", report, parent=self.root)
+
+    def _on_open_config_dir(self):
+        try:
+            os.startfile(os.path.dirname(os.path.abspath(appconfig.CONFIG_FILE)))
+        except OSError as e:
+            messagebox.showerror("Папка не открылась", str(e), parent=self.root)
+
     # ── Inspector panel ───────────────────────────────────────────────────────
     def _build_inspector(self, parent):
-        insp = tk.Frame(parent, bg="#222", width=370, bd=1, relief=tk.RAISED)
-        insp.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
-        insp.grid_propagate(False)
+        S = theme.SURFACE
+        card = ctk.CTkFrame(parent, fg_color=S, corner_radius=theme.RADIUS,
+                            width=392, border_width=0)
+        card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        card.grid_propagate(False)
+        card.pack_propagate(False)
+        insp = tk.Frame(card, bg=S)
+        insp.pack(fill=tk.BOTH, expand=True, padx=16, pady=14)
         self._inspector_frame = insp
 
-        # === 1. Header ===
-        self._insp_header = tk.Label(insp, text="Выберите элемент на схеме",
-                                      fg="white", bg="#222",
-                                      font=("Segoe UI", 11, "bold"),
-                                      anchor="w", wraplength=300)
-        self._insp_header.pack(fill=tk.X, padx=10, pady=(10, 2))
-
-        # Separator
-        ttk.Separator(insp, orient="horizontal").pack(fill=tk.X, padx=10, pady=2)
+        # === 1. Заголовок ===
+        self._insp_header = tk.Label(insp, text="Ничего не выбрано", fg=theme.TEXT,
+                                     bg=S, font=theme.F_TITLE, anchor="w")
+        self._insp_header.pack(fill=tk.X)
+        self._insp_hint = tk.Label(
+            insp, text="Нажми пэд, крутилку или кнопку на схеме слева —\n"
+                       "здесь появится, что она делает.",
+            fg=theme.MUTED, bg=S, font=theme.F_SMALL, anchor="w", justify=tk.LEFT)
+        self._insp_hint.pack(fill=tk.X, pady=(4, 0))
 
         # === Content area (hidden until element selected) ===
-        self._insp_content = tk.Frame(insp, bg="#222")
+        self._insp_content = tk.Frame(insp, bg=S)
 
         # === 1b. Привязка MIDI ===
         # Пэды и крутилки опознаются по картам нот и CC. Кнопки справа шлют
         # неизвестные CC — карты для них нет, и без ручной привязки нажатие
         # физической кнопки не доходит ни до чего.
-        learn = self._learn_frame = tk.Frame(self._insp_content, bg="#222")
-        learn.pack(fill=tk.X, padx=10, pady=(6, 2))
+        learn = self._learn_frame = tk.Frame(self._insp_content, bg=S)
+        learn.pack(fill=tk.X, pady=(8, 4))
 
-        learn_row = tk.Frame(learn, bg="#222")
+        learn_row = tk.Frame(learn, bg=S)
         learn_row.pack(fill=tk.X)
-        tk.Label(learn_row, text="MIDI:", fg="#aaa", bg="#222",
-                 font=("Segoe UI", 9)).pack(side=tk.LEFT)
-        self._learn_lbl = tk.Label(learn_row, text="—", fg="#888", bg="#222",
-                                    font=("Segoe UI", 9), anchor="w")
-        self._learn_lbl.pack(side=tk.LEFT, padx=(4, 0))
-        self._learn_btn = tk.Button(learn_row, text="Привязать",
-                                     command=self._on_learn_toggle,
-                                     bg="#334", fg="#aaf", bd=0, padx=8,
-                                     font=("Segoe UI", 8), cursor="hand2")
+        tk.Label(learn_row, text="MIDI", fg=theme.MUTED, bg=theme.SURFACE_2,
+                 font=theme.F_TINY, padx=6).pack(side=tk.LEFT)
+        self._learn_lbl = tk.Label(learn_row, text="—", fg=theme.MUTED, bg=S,
+                                   font=theme.F_SMALL, anchor="w")
+        self._learn_lbl.pack(side=tk.LEFT, padx=(8, 0))
+        self._learn_btn = self._btn(learn_row, "Привязать", self._on_learn_toggle,
+                                    width=86, height=26)
         self._learn_btn.pack(side=tk.RIGHT)
-        tk.Button(learn_row, text="Забыть", command=self._on_learn_forget,
-                  bg="#3a2a2a", fg="#faa", bd=0, padx=8,
-                  font=("Segoe UI", 8), cursor="hand2").pack(side=tk.RIGHT, padx=(0, 5))
+        self._btn(learn_row, "Забыть", self._on_learn_forget, width=66,
+                  height=26).pack(side=tk.RIGHT, padx=(0, 6))
 
         # Привязка «задним числом». Ловить сигнал в момент нажатия — гонка:
         # надо успеть нажать «Привязать», не потерять выделение и попасть по
         # кнопке. Последнее непривязанное сообщение запоминается, и его можно
         # повесить на элемент одним кликом уже ПОСЛЕ того, как оно пришло.
-        self._bind_last_btn = tk.Button(learn, text="", command=self._on_bind_last,
-                                         bg="#2a4a2a", fg="#cfc", bd=0, padx=8,
-                                         font=("Segoe UI", 8), cursor="hand2",
-                                         anchor="w")
+        self._bind_last_btn = self._btn(learn, "", self._on_bind_last, kind="success",
+                                        height=28, anchor="w")
         # not packed yet
 
-        # === 2. Knob mode switcher ===
-        self._knob_mode_frame = tk.Frame(self._insp_content, bg="#222")
+        # === 2. Режим крутилки ===
+        self._knob_mode_frame = tk.Frame(self._insp_content, bg=S)
         self._knob_mode_var = tk.StringVar(value="delta")
-        tk.Label(self._knob_mode_frame, text="Режим:", fg="#aaa", bg="#222",
-                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 5))
-        tk.Radiobutton(self._knob_mode_frame, text="Вращение", variable=self._knob_mode_var,
-                       value="delta", command=self._on_knob_mode_change,
-                       bg="#222", fg="#ccc", selectcolor="#333",
-                       activebackground="#222", activeforeground="#fff",
-                       font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=3)
-        tk.Radiobutton(self._knob_mode_frame, text="Влево / вправо", variable=self._knob_mode_var,
-                       value="pair", command=self._on_knob_mode_change,
-                       bg="#222", fg="#ccc", selectcolor="#333",
-                       activebackground="#222", activeforeground="#fff",
-                       font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=3)
+        self._knob_mode_names = {"delta": "Плавно", "pair": "Влево / вправо"}
+        self._knob_mode_seg = ctk.CTkSegmentedButton(
+            self._knob_mode_frame, values=list(self._knob_mode_names.values()),
+            command=self._on_knob_mode_seg, font=theme.C_SMALL, height=30,
+            fg_color=theme.SURFACE_2, unselected_color=theme.SURFACE_2,
+            unselected_hover_color=theme.SURFACE_3, selected_color=theme.ACCENT,
+            selected_hover_color=theme.ACCENT_HOVER, text_color=theme.TEXT)
+        self._knob_mode_seg.pack(fill=tk.X)
+        # Переключатель — только отображение. Источник правды — переменная:
+        # её выставляют select_element и тесты, трасса держит кнопку в согласии.
+        self._knob_mode_var.trace_add("write", lambda *a: self._knob_mode_seg.set(
+            self._knob_mode_names.get(self._knob_mode_var.get(), "Плавно")))
         # Not packed yet — shown only for knobs
 
-        # === 2b. Pair slots (shown in pair mode) ===
-        self._pair_frame = tk.Frame(self._insp_content, bg="#222")
+        # === 2b. Стороны (режим «влево / вправо») ===
+        self._pair_frame = tk.Frame(self._insp_content, bg=S)
         self._pair_slot = tk.StringVar(value="ccw")  # which slot is being assigned
-        tk.Radiobutton(self._pair_frame, text="◀ Влево:", variable=self._pair_slot,
-                       value="ccw", command=self._on_pair_slot_change,
-                       bg="#222", fg="#ccc", selectcolor="#333",
-                       activebackground="#222", activeforeground="#fff",
-                       font=("Segoe UI", 9)).pack(anchor="w", padx=10)
-        self._pair_ccw_lbl = tk.Label(self._pair_frame, text="—", fg="#888",
-                                       bg="#222", font=("Segoe UI", 9), anchor="w")
-        self._pair_ccw_lbl.pack(fill=tk.X, padx=30)
-        tk.Radiobutton(self._pair_frame, text="▶ Вправо:", variable=self._pair_slot,
-                       value="cw", command=self._on_pair_slot_change,
-                       bg="#222", fg="#ccc", selectcolor="#333",
-                       activebackground="#222", activeforeground="#fff",
-                       font=("Segoe UI", 9)).pack(anchor="w", padx=10)
-        self._pair_cw_lbl = tk.Label(self._pair_frame, text="—", fg="#888",
-                                      bg="#222", font=("Segoe UI", 9), anchor="w")
-        self._pair_cw_lbl.pack(fill=tk.X, padx=30)
+        for value, text in (("ccw", "◀ Влево"), ("cw", "Вправо ▶")):
+            row = tk.Frame(self._pair_frame, bg=S)
+            row.pack(fill=tk.X, pady=1)
+            ctk.CTkRadioButton(row, text=text, variable=self._pair_slot, value=value,
+                               command=self._on_pair_slot_change, font=theme.C_SMALL,
+                               text_color=theme.TEXT, fg_color=theme.ACCENT,
+                               border_color=theme.SURFACE_3, width=100,
+                               radiobutton_width=16, radiobutton_height=16).pack(side=tk.LEFT)
+            lbl = tk.Label(row, text="—", fg=theme.MUTED, bg=S, font=theme.F_SMALL,
+                           anchor="w")
+            lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            if value == "ccw":
+                self._pair_ccw_lbl = lbl
+            else:
+                self._pair_cw_lbl = lbl
 
-        # === 3. Search ===
-        search_frame = tk.Frame(self._insp_content, bg="#222")
-        search_frame.pack(fill=tk.X, padx=10, pady=(5, 3))
+        # === 2c. Вкладки пэда: «Действие» / «Цвет» ===
+        self._tab_seg = ctk.CTkSegmentedButton(
+            self._insp_content, values=["Действие", "Цвет"], command=self._show_tab,
+            font=theme.C_SMALL, height=30, fg_color=theme.SURFACE_2,
+            unselected_color=theme.SURFACE_2, unselected_hover_color=theme.SURFACE_3,
+            selected_color=theme.SURFACE_3, selected_hover_color=theme.SURFACE_3,
+            text_color=theme.TEXT)
+        self._tab_seg.set("Действие")
+        # Not packed yet — shown only for pads
+
+        # ── Вкладка «Действие» ───────────────────────────────────────────────
+        self._tab_action = tk.Frame(self._insp_content, bg=S)
+        self._tab_action.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        self._visible_tab = self._tab_action
+
+        # === 3. Поиск ===
+        search_frame = self._search_frame = tk.Frame(self._tab_action, bg=S)
+        search_frame.pack(fill=tk.X, pady=(0, 6))
         self._search_var = tk.StringVar()
-        search_entry = ttk.Entry(search_frame, textvariable=self._search_var, width=30,
-                                  font=("Segoe UI", 9))
-        search_entry.pack(fill=tk.X)
-        # Placeholder
-        self._search_entry = search_entry
-        self._search_placeholder_active = True
-        search_entry.insert(0, "поиск действия…")
-        search_entry.config(foreground="#888")
-        search_entry.bind("<FocusIn>", self._search_focus_in)
-        search_entry.bind("<FocusOut>", self._search_focus_out)
+        self._search_placeholder_active = False   # плейсхолдер рисует сам CTkEntry
+        self._search_entry = ctk.CTkEntry(
+            search_frame, placeholder_text="Поиск действия…", height=32,
+            font=theme.C_SMALL, fg_color=theme.SURFACE_2, border_color=theme.SURFACE_3,
+            border_width=1, text_color=theme.TEXT, placeholder_text_color=theme.DIM,
+            corner_radius=theme.RADIUS_SM)
+        self._search_entry.pack(fill=tk.X)
+        # textvariable у CTkEntry отключает плейсхолдер — поэтому переменная
+        # поиска кормится с клавиатуры, а не привязкой.
+        self._search_entry.bind("<KeyRelease>", lambda e: self._search_var.set(
+            self._search_entry.get()))
         self._search_var.trace_add("write", self._on_search_changed)
 
-        # === 4. Action tree ===
-        tree_frame = tk.Frame(self._insp_content, bg="#222")
-        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=3)
-
+        # === 4. Список действий ===
+        tree_frame = tk.Frame(self._tab_action, bg=theme.SURFACE_2)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
         self._action_tree = ttk.Treeview(tree_frame, height=12, show="tree",
-                                          selectmode="browse")
-        tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical",
-                                     command=self._action_tree.yview)
+                                         selectmode="browse")
+        tree_scroll = ctk.CTkScrollbar(tree_frame, command=self._action_tree.yview,
+                                       fg_color=theme.SURFACE_2,
+                                       button_color=theme.SURFACE_3,
+                                       button_hover_color=theme.DIM, width=12)
         self._action_tree.configure(yscrollcommand=tree_scroll.set)
-        self._action_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._action_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0), pady=6)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=2, pady=4)
         self._action_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
-        # === 5. Description ===
-        self._desc_lbl = tk.Label(self._insp_content, text="", fg="#aaa", bg="#222",
-                                   font=("Segoe UI", 9), anchor="w",
-                                   wraplength=300, justify=tk.LEFT)
-        self._desc_lbl.pack(fill=tk.X, padx=10, pady=(3, 5))
+        # === 5. Описание ===
+        self._desc_lbl = tk.Label(self._tab_action, text="", fg=theme.MUTED, bg=S,
+                                  font=theme.F_SMALL, anchor="w",
+                                  wraplength=350, justify=tk.LEFT)
+        self._desc_lbl.pack(fill=tk.X, pady=(6, 0))
 
-        # === 6. Parameter area ===
-        self._param_frame = tk.Frame(self._insp_content, bg="#222")
-        # Will be dynamically populated
-        self._param_label = tk.Label(self._param_frame, text="Параметр:", fg="#aaa",
-                                      bg="#222", font=("Segoe UI", 9))
-        self._param_label.pack(side=tk.LEFT, padx=(0, 5))
+        # === 6. Параметр ===
+        self._param_frame = tk.Frame(self._tab_action, bg=S)
+        self._param_label = tk.Label(self._param_frame, text="Параметр", fg=theme.MUTED,
+                                     bg=S, font=theme.F_SMALL)
+        self._param_label.pack(side=tk.LEFT, padx=(0, 8))
         self._param_var = tk.StringVar()
-        self._param_entry = tk.Entry(self._param_frame, textvariable=self._param_var,
-                                      bg="#333", fg="#fff", insertbackground="#fff",
-                                      font=("Segoe UI", 9), bd=1, relief=tk.FLAT, width=20)
+        self._param_entry = ctk.CTkEntry(
+            self._param_frame, textvariable=self._param_var, height=30,
+            font=theme.C_SMALL, fg_color=theme.SURFACE_2, border_color=theme.SURFACE_3,
+            border_width=1, text_color=theme.TEXT, corner_radius=theme.RADIUS_SM)
         self._param_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._param_entry.bind("<FocusOut>", self._on_param_commit)
         self._param_entry.bind("<Return>", self._on_param_commit)
-        self._param_btn = tk.Button(self._param_frame, text="Обзор…",
-                                     command=self._on_param_browse,
-                                     bg="#334", fg="#aaf", bd=0, padx=6,
-                                     font=("Segoe UI", 8), cursor="hand2")
-        self._param_btn.pack(side=tk.LEFT, padx=(5, 0))
+        self._param_btn = self._btn(self._param_frame, "Обзор…", self._on_param_browse,
+                                    width=86)
+        self._param_btn.pack(side=tk.LEFT, padx=(6, 0))
         # Not packed yet
 
-        # === 7. Color area (pads only) ===
-        self._color_frame = tk.Frame(self._insp_content, bg="#222")
+        # ── Вкладка «Цвет» ───────────────────────────────────────────────────
+        self._tab_color = tk.Frame(self._insp_content, bg=S)
+        self._color_frame = self._tab_color   # прежнее имя: на него ссылается код
 
-        color_row1 = tk.Frame(self._color_frame, bg="#222")
-        color_row1.pack(fill=tk.X, padx=0, pady=2)
-        tk.Label(color_row1, text="Цвет:", fg="#aaa", bg="#222",
-                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 5))
+        self._lbl(self._tab_color, "Цвет пэда", fg=theme.MUTED).pack(anchor="w")
+        pal = tk.Frame(self._tab_color, bg=S)
+        pal.pack(fill=tk.X, pady=(6, 10))
         self._color_preset_btns = []
-        for hex_c in COLOR_PRESETS:
-            btn = tk.Button(color_row1, bg=hex_c, width=2, height=1, relief=tk.FLAT,
-                            bd=0, cursor="hand2",
-                            command=lambda c=hex_c: self._apply_color(c))
-            btn.pack(side=tk.LEFT, padx=1)
+        for i, hex_c in enumerate(COLOR_PRESETS):
+            btn = ctk.CTkButton(pal, text="", width=26, height=26, corner_radius=13,
+                                fg_color=hex_c, hover_color=hex_c,
+                                border_width=2 if hex_c == "#000000" else 0,
+                                border_color=theme.SURFACE_3,
+                                command=lambda c=hex_c: self._apply_color(c))
+            btn.grid(row=i // 6, column=i % 6, padx=3, pady=3)
             self._color_preset_btns.append((hex_c, btn))
-        tk.Button(color_row1, text="…", command=self._pick_custom_color,
-                  bg="#444", fg="#fff", bd=0, padx=4, font=("Segoe UI", 9),
-                  cursor="hand2").pack(side=tk.LEFT, padx=(5, 0))
+        # Свой цвет — такой же кружок: широкая кнопка раздвигала колонку сетки
+        custom = self._btn(pal, "+", self._pick_custom_color, width=26, height=26,
+                           corner_radius=13)
+        custom.grid(row=1, column=5, padx=3, pady=3)
+        ToolTip(custom, lambda: "Свой цвет…")
 
-        color_row2 = tk.Frame(self._color_frame, bg="#222")
-        color_row2.pack(fill=tk.X, padx=0, pady=2)
+        hexrow = tk.Frame(self._tab_color, bg=S)
+        hexrow.pack(fill=tk.X, pady=(0, 10))
+        self._lbl(hexrow, "Код", fg=theme.MUTED).pack(side=tk.LEFT, padx=(0, 8))
         self._color_hex_var = tk.StringVar()
-        tk.Label(color_row2, text="Hex:", fg="#aaa", bg="#222",
-                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 5))
-        color_hex_entry = tk.Entry(color_row2, textvariable=self._color_hex_var,
-                                    bg="#333", fg="#fff", insertbackground="#fff",
-                                    font=("Consolas", 9), bd=1, relief=tk.FLAT, width=9)
+        color_hex_entry = ctk.CTkEntry(
+            hexrow, textvariable=self._color_hex_var, width=100, height=30,
+            font=theme.C_MONO, fg_color=theme.SURFACE_2, border_color=theme.SURFACE_3,
+            border_width=1, text_color=theme.TEXT, corner_radius=theme.RADIUS_SM)
         color_hex_entry.pack(side=tk.LEFT)
         color_hex_entry.bind("<Return>", self._on_color_hex_commit)
         color_hex_entry.bind("<FocusOut>", self._on_color_hex_commit)
 
-        tk.Label(color_row2, text="Яркость:", fg="#aaa", bg="#222",
-                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(15, 5))
+        brow = tk.Frame(self._tab_color, bg=S)
+        brow.pack(fill=tk.X, pady=(0, 10))
+        self._lbl(brow, "Яркость пэда", fg=theme.MUTED).pack(side=tk.LEFT, padx=(0, 8))
         self._brightness_var = tk.IntVar(value=100)
-        self._brightness_scale = tk.Scale(color_row2, from_=10, to=100,
-                                           orient=tk.HORIZONTAL, variable=self._brightness_var,
-                                           bg="#222", fg="#aaa", troughcolor="#444",
-                                           highlightthickness=0, length=100, sliderlength=15,
-                                           command=self._on_brightness_change)
-        self._brightness_scale.pack(side=tk.LEFT)
+        self._brightness_scale = ctk.CTkSlider(
+            brow, from_=10, to=100, number_of_steps=90, variable=self._brightness_var,
+            command=self._on_brightness_change, height=16,
+            progress_color=theme.ACCENT, button_color=theme.TEXT,
+            button_hover_color="#ffffff", fg_color=theme.SURFACE_3)
+        self._brightness_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        color_row3 = tk.Frame(self._color_frame, bg="#222")
-        color_row3.pack(fill=tk.X, padx=0, pady=(2, 0))
         # «Как отправить цвет на пэд» не должно быть вопросом: цвет уходит
         # сразу при выборе. Кнопка нужна на случай, когда устройство
         # переподключилось — записи цвета волатильные.
-        self._color_hint_lbl = tk.Label(color_row3, text="", fg="#888", bg="#222",
-                                         font=("Segoe UI", 8), anchor="w")
-        self._color_hint_lbl.pack(side=tk.LEFT)
-        tk.Button(color_row3, text="Отправить заново", command=self._on_resend_colors,
-                  bg="#334", fg="#aaf", bd=0, padx=6,
-                  font=("Segoe UI", 8), cursor="hand2").pack(side=tk.RIGHT)
-        # Not packed yet
+        crow = tk.Frame(self._tab_color, bg=S)
+        crow.pack(fill=tk.X)
+        self._color_hint_lbl = tk.Label(crow, text="", fg=theme.MUTED, bg=S,
+                                        font=theme.F_TINY, anchor="w", justify=tk.LEFT,
+                                        wraplength=220)
+        self._color_hint_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._btn(crow, "Отправить заново", self._on_resend_colors, width=130,
+                  height=28).pack(side=tk.RIGHT)
 
-        # === 8. Buttons ===
-        # Именованный: блоки параметра и цвета пакуются динамически ПОЗЖЕ,
-        # а pack без before кладёт их в самый низ — под кнопки сброса.
-        # Инспектор тогда читается сверху вниз как бессмыслица.
-        btn_frame = self._btn_frame = tk.Frame(self._insp_content, bg="#222")
-        btn_frame.pack(fill=tk.X, padx=10, pady=(5, 2))
+        # === 8. Кнопки действий ===
+        # Именованный: блоки вкладок пакуются динамически ПОЗЖЕ, а pack без
+        # before кладёт их в самый низ — под кнопки. Вкладка встаёт before=сюда.
+        btn_frame = self._btn_frame = tk.Frame(self._insp_content, bg=S)
+        btn_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(10, 0))
 
-        tk.Button(btn_frame, text="Выполнить", command=self._on_execute,
-                  bg="#335533", fg="#aaffaa", bd=0, padx=10,
-                  font=("Segoe UI", 9), cursor="hand2").pack(side=tk.LEFT, padx=(0, 5))
-        self._exec_error_lbl = tk.Label(btn_frame, text="", fg="#ff4444", bg="#222",
-                                         font=("Segoe UI", 8), anchor="w")
-        self._exec_error_lbl.pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Очистить", command=self.clear_current,
-                  bg="#552222", fg="white", bd=0, padx=10,
-                  font=("Segoe UI", 9), cursor="hand2").pack(side=tk.RIGHT)
+        row = tk.Frame(btn_frame, bg=S)
+        row.pack(fill=tk.X)
+        self._btn(row, "Выполнить", self._on_execute, kind="primary",
+                  width=120, height=34).pack(side=tk.LEFT)
+        self._btn(row, "Очистить", self.clear_current, width=96,
+                  height=34).pack(side=tk.RIGHT)
+        self._exec_error_lbl = tk.Label(btn_frame, text="", fg=theme.DANGER, bg=S,
+                                        font=theme.F_TINY, anchor="w")
+        self._exec_error_lbl.pack(fill=tk.X, pady=(4, 0))
+        ctk.CTkButton(btn_frame, text="Сбросить все назначения", command=self.clear_all,
+                      fg_color="transparent", hover_color=theme.DANGER_DARK,
+                      text_color=theme.DANGER, font=theme.C_TINY, height=24,
+                      width=10).pack(anchor="e", pady=(6, 0))
 
-        # Separator + Reset All
-        ttk.Separator(self._insp_content, orient="horizontal").pack(fill=tk.X,
-                                                                      padx=10, pady=(8, 5))
-        tk.Button(self._insp_content, text="Сбросить всё", command=self.clear_all,
-                  bg="#aa3333", fg="white", bd=0, padx=10,
-                  font=("Segoe UI", 9), cursor="hand2").pack(pady=(0, 10))
+    def _show_tab(self, name):
+        """Вкладка пэда. Для крутилок и кнопок видна всегда «Действие»."""
+        tab = self._tab_color if name == "Цвет" else self._tab_action
+        if tab is not self._visible_tab:
+            self._visible_tab.pack_forget()
+            self._visible_tab = tab
+        tab.pack(fill=tk.BOTH, expand=True, pady=(6, 0), before=self._btn_frame)
+        self._tab_seg.set("Цвет" if tab is self._tab_color else "Действие")
+
+    def _on_knob_mode_seg(self, label):
+        mode = "pair" if label == self._knob_mode_names["pair"] else "delta"
+        self._knob_mode_var.set(mode)
+        self._on_knob_mode_change()
 
     # ── Tooltip helper ────────────────────────────────────────────────────────
     def _attach_tooltip(self, widget, uid):
@@ -954,8 +1158,8 @@ class App:
             # включалась. Под pythonw трейсбек уходил в несуществующий
             # stderr, и обработчик ошибок Tk валился следом — снаружи это
             # выглядело как зависание.
-            self._pair_frame.pack(fill=tk.X, padx=10, pady=(2, 3),
-                                   before=self._search_entry.master)
+            self._pair_frame.pack(fill=tk.X, pady=(6, 0),
+                                  before=self._visible_tab)
         else:
             self._pair_frame.pack_forget()
 
@@ -1013,19 +1217,19 @@ class App:
         self._current_param_kind = act.param_kind
 
         if act.param_kind == "hotkey":
-            self._param_entry.config(state="readonly")
-            self._param_btn.config(text="Записать", command=self._on_record_hotkey)
+            self._param_entry.configure(state="readonly")
+            self._param_btn.configure(text="Записать", command=self._on_record_hotkey)
             self._param_btn.pack(side=tk.LEFT, padx=(5, 0))
         elif act.param_kind == "exe":
-            self._param_entry.config(state="normal")
-            self._param_btn.config(text="Обзор…", command=self._on_param_browse)
+            self._param_entry.configure(state="normal")
+            self._param_btn.configure(text="Обзор…", command=self._on_param_browse)
             self._param_btn.pack(side=tk.LEFT, padx=(5, 0))
         elif act.param_kind == "folder":
-            self._param_entry.config(state="normal")
-            self._param_btn.config(text="Обзор…", command=self._on_param_browse)
+            self._param_entry.configure(state="normal")
+            self._param_btn.configure(text="Обзор…", command=self._on_param_browse)
             self._param_btn.pack(side=tk.LEFT, padx=(5, 0))
         elif act.param_kind in ("url", "text"):
-            self._param_entry.config(state="normal")
+            self._param_entry.configure(state="normal")
             self._param_btn.pack_forget()
         else:
             self._param_frame.pack_forget()
@@ -1034,9 +1238,9 @@ class App:
         # Параметр — главное поле после выбора действия, он идёт НАД цветом.
         # Оба блока пакуются динамически, поэтому порядок задаётся явно через
         # before, иначе кто сработал последним, тот и оказался ниже.
-        el = self.ui_elements.get(self.current_sel, {})
-        anchor = self._color_frame if el.get("type") == "pad" else self._btn_frame
-        self._param_frame.pack(fill=tk.X, padx=10, pady=(3, 3), before=anchor)
+        # Параметр живёт внизу вкладки «Действие», под описанием: он
+        # последний в своей рамке, и pack без before ставит его ровно туда.
+        self._param_frame.pack(fill=tk.X, pady=(8, 0))
 
     def _on_param_commit(self, event=None):
         if not self.current_sel:
@@ -1222,7 +1426,7 @@ class App:
         # Кнопка «привязать задним числом» — только когда есть что вешать.
         if self._last_unbound and self._learn_uid != uid:
             kind, mid = self._last_unbound
-            self._bind_last_btn.config(
+            self._bind_last_btn.configure(
                 text=f"⇦ повесить сюда {'CC' if kind == 'cc' else 'ноту'} {mid}")
             self._bind_last_btn.pack(fill=tk.X, pady=(4, 0))
         else:
@@ -1231,13 +1435,15 @@ class App:
         if self._learn_uid == uid:
             self._learn_lbl.config(text="нажмите контрол на устройстве…",
                                    fg="#ffaa00")
-            self._learn_btn.config(text="Отмена", bg="#553322", fg="#fc9")
+            self._learn_btn.configure(text="Отмена", fg_color=theme.WARN,
+                                      hover_color=theme.WARN, text_color="#1a1300")
             self._learn_banner.config(
                 text=f"ПРИВЯЗКА {uid.upper()} — нажмите контрол на устройстве")
             self._learn_banner.pack(side=tk.LEFT, padx=10)
             return
         self._learn_banner.pack_forget()
-        self._learn_btn.config(text="Привязать", bg="#334", fg="#aaf")
+        self._learn_btn.configure(text="Привязать", fg_color=theme.SURFACE_2,
+                                  hover_color=theme.SURFACE_3, text_color=theme.TEXT)
         el = self.ui_elements[uid]
         mid = el.get("midi_id")
         if mid is None:
@@ -1286,28 +1492,37 @@ class App:
         self._insp_header.config(text=name)
 
         # Show content area
+        self._insp_hint.pack_forget()
         self._insp_content.pack(fill=tk.BOTH, expand=True)
 
         # Highlight selection on device
         for k, v in self.ui_elements.items():
             if v["type"] in ["pad", "btn"]:
-                v["outer"].config(bg="#00c8ff" if k == uid else "#000")
+                v["outer"].config(bg=theme.ACCENT if k == uid else theme.SURFACE)
             elif v["type"] == "knob":
-                v["num"].config(fg="#00c8ff" if k == uid else "#555")
+                v["num"].config(fg=theme.ACCENT if k == uid else theme.DIM)
 
         # Get binding
         bindings = appconfig.config["bindings"]
         b = bindings.get(uid, {})
 
+        # Вкладки есть только у пэда. Крутилка и кнопка всегда на «Действии»:
+        # вкладку ставим ДО блоков режима — они пакуются before=неё.
+        if el["type"] == "pad":
+            self._tab_seg.pack(fill=tk.X, pady=(6, 0), before=self._visible_tab)
+        else:
+            self._tab_seg.pack_forget()
+            self._show_tab("Действие")
+
         # Show/hide knob mode switcher
         if el["type"] == "knob":
             mode = b.get("mode", "delta")
             self._knob_mode_var.set(mode)
-            self._knob_mode_frame.pack(fill=tk.X, padx=10, pady=(3, 3),
-                                        before=self._search_entry.master)
+            self._knob_mode_frame.pack(fill=tk.X, pady=(6, 0),
+                                       before=self._visible_tab)
             if mode == "pair":
-                self._pair_frame.pack(fill=tk.X, padx=10, pady=(2, 3),
-                                       before=self._search_entry.master)
+                self._pair_frame.pack(fill=tk.X, pady=(6, 0),
+                                      before=self._visible_tab)
                 self._update_pair_labels()
             else:
                 self._pair_frame.pack_forget()
@@ -1315,23 +1530,20 @@ class App:
             self._knob_mode_frame.pack_forget()
             self._pair_frame.pack_forget()
 
-        # Show/hide color area
+        # Цвет — только у пэда; сама вкладка уже собрана, заполняем значения
         if el["type"] == "pad":
-            self._color_frame.pack(fill=tk.X, padx=10, pady=(3, 3),
-                                   before=self._btn_frame)
             col = b.get("color")
             if not (isinstance(col, str) and col.startswith("#")):
                 col = DEFAULT_PAD_COLOR
             self._color_base = col
             self._color_hex_var.set(col)
-            # tk.Scale дёргает command и на программную установку. Без флага
-            # простой клик по пэду переписывал бы его цвет и слал кадр в эфир.
+            # Флаг — на случай, если ползунок дёрнет command на программную
+            # установку. Без него простой клик по пэду переписывал бы его цвет
+            # и слал кадр в эфир (так вёл себя прежний tk.Scale).
             self._suspend_brightness = True
             self._brightness_var.set(100)
             self._suspend_brightness = False
             self._update_color_hint()
-        else:
-            self._color_frame.pack_forget()
 
         self._update_learn_row()
 
@@ -1453,7 +1665,8 @@ class App:
             elif el["type"] == "btn":
                 # Значок кнопки живёт в отдельной метке и не затирается:
                 # иначе после назначения не понять, какая это кнопка.
-                el["lbl"].config(text=display.replace("+\n", "+").replace("\n", " ")[:14],
+                el["lbl"].config(text=_ellipsize(
+                                     display.replace("+\n", "+").replace("\n", " "), 17),
                                  fg="#0f0" if display else "#666")
             elif el["type"] == "knob":
                 mode = data.get("mode", "delta")
@@ -1801,6 +2014,12 @@ class App:
 
             if msg.startswith("status:"):
                 self.status_var.set(msg.split(":", 1)[1])
+
+            elif msg.startswith("battery:"):
+                try:
+                    self._set_battery(int(msg.split(":", 1)[1]))
+                except ValueError:
+                    pass
 
             elif msg.startswith("color:"):
                 self._color_ok = msg.split(":", 1)[1] == "есть"

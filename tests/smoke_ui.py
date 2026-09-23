@@ -482,6 +482,54 @@ def real_pycaw_endpoint_resolves():
     return f"уровень системы: {round(level * 100)}%"
 check("настоящий pycaw отдаёт рабочую конечную точку", real_pycaw_endpoint_resolves)
 
+print("\n── новая панель: вкладки, заряд, режим крутилки ─────────")
+
+def pad_has_tabs_knob_does_not():
+    app.select_element("pad_2"); root.update()
+    assert app._tab_seg.winfo_ismapped(), "у пэда нет вкладок"
+    app._show_tab("Цвет"); root.update()
+    assert app._tab_color.winfo_ismapped() and not app._tab_action.winfo_ismapped()
+    # крутилка обязана вернуть «Действие», иначе список действий не виден
+    app.select_element("knob_2"); root.update()
+    assert not app._tab_seg.winfo_ismapped(), "у крутилки видны вкладки пэда"
+    assert app._action_tree.winfo_ismapped(), "у крутилки не виден список действий"
+    assert app._knob_mode_frame.winfo_ismapped()
+    # блоки идут сверху вниз: режим → вкладка → кнопки
+    ys = [w.winfo_y() for w in (app._knob_mode_frame, app._tab_action, app._btn_frame)]
+    assert ys == sorted(ys), f"порядок блоков сломан: {ys}"
+    return ys
+check("вкладки у пэда, «Действие» у крутилки, порядок блоков", pad_has_tabs_knob_does_not)
+
+def knob_seg_follows_var():
+    app.select_element("knob_3")
+    app._knob_mode_var.set("pair"); root.update()
+    assert app._knob_mode_seg.get() == "Влево / вправо", app._knob_mode_seg.get()
+    app._knob_mode_var.set("delta"); root.update()
+    assert app._knob_mode_seg.get() == "Плавно"
+    app._on_knob_mode_change()
+    return app._knob_mode_seg.get()
+check("переключатель режима следует за переменной", knob_seg_follows_var)
+
+def battery_messages():
+    for m in ("battery:37", "battery:12", "battery:-1"):
+        midi_gui.ble.msg_queue.put(m)
+        app.check_queue(); root.update()
+    got = []
+    for m in ("battery:37",):
+        midi_gui.ble.msg_queue.put(m); app.check_queue(); root.update()
+        got.append(app._battery_lbl.cget("text"))
+    midi_gui.ble.msg_queue.put("battery:-1"); app.check_queue(); root.update()
+    got.append(app._battery_lbl.cget("text"))
+    assert got == ["37%", "—"], got
+    return got
+check("заряд: процент и прочерк при обрыве", battery_messages)
+
+def firmware_buttons_not_bindable():
+    assert not any(k in app.ui_elements for k in ("btn_9", "btn_10")), \
+        "Shift/Note Repeat попали в назначаемые элементы"
+    return len(app.ui_elements)
+check("Shift и Note Repeat не назначаются", firmware_buttons_not_bindable)
+
 root.destroy()
 
 print()
