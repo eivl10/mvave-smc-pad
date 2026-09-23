@@ -206,6 +206,27 @@ async def _drain_commands(client, state):
 
 # ── основной цикл ────────────────────────────────────────────────────────────
 
+BATTERY_CHAR = "00002a19-0000-1000-8000-00805f9b34fb"   # Battery Level, 0-100 %
+
+
+def _on_battery(_handle, data):
+    if data:
+        msg_queue.put(f"battery:{int(data[0])}")
+
+
+async def _open_battery(client):
+    """Заряд: прочитать сразу, дальше устройство само шлёт изменения.
+
+    Замер 2026-09-23: 2A19 у SMC-PAD — read + notify, читается без сопряжения.
+    Сбой здесь не должен рвать подключение: заряд — справка, не функция.
+    """
+    try:
+        _on_battery(None, await client.read_gatt_char(BATTERY_CHAR))
+        await client.start_notify(BATTERY_CHAR, _on_battery)
+    except Exception as e:
+        _log(f"заряд недоступен: {type(e).__name__}: {e}")
+
+
 async def _resolve_address():
     """Адрес контроллера: из конфига, из прошлого подключения или поиском."""
     global _address
@@ -250,6 +271,7 @@ async def ble_loop():
 
                 msg_queue.put("status:Подключено")
                 await client.start_notify(MIDI_CHAR, notification_handler)
+                await _open_battery(client)
 
                 state = await _open_vendor(client)
                 await _reapply_colors(client, state)
@@ -258,6 +280,7 @@ async def ble_loop():
                     await _drain_commands(client, state)
                     await asyncio.sleep(0.05)
         except Exception as e:
+            msg_queue.put("battery:-1")   # старый процент без связи — неправда
             msg_queue.put("status:Переподключение...")
             _log(f"BLE: {type(e).__name__}: {e}")
             await asyncio.sleep(2)
