@@ -12,3 +12,6 @@ midi_config.json
 # local-only: session handoff notes, history backups
 HANDOFF.md
 _backup/
+
+# собранный exe (tools/build_exe.py) — идёт в GitHub Release, не в git
+release/
