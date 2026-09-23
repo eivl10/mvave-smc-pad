@@ -1,6 +1,8 @@
 # M-Vave SMC-PAD Windows Bridge
 
-**EN.** Windows desktop app that connects the M-Vave SMC-PAD Bluetooth MIDI controller directly over BLE (no MIDI drivers) and maps its 16 pads, 8 endless knobs and 8 buttons to PC actions: volume with an on-screen indicator, media, windows, virtual desktops, browser, custom hotkeys, launching programs, pad colours and monitor brightness. Lives in the system tray. Python 3 + tkinter + bleak.
+**EN.** Windows desktop app that connects the M-Vave SMC-PAD Bluetooth MIDI controller directly over BLE (no MIDI drivers) and maps its 16 pads, 8 endless knobs and 8 buttons to PC actions: volume with an on-screen indicator, media, windows, virtual desktops, browser, custom hotkeys, launching programs, pad colours and monitor brightness. Shows the controller's battery level. Settings export to a file and import on another PC. Lives in the system tray. Python 3 + CustomTkinter + bleak.
+
+**Easiest:** download `SMC-PAD.exe` from [Releases](https://github.com/eivl10/mvave-smc-pad/releases) — no Python needed. Or from source:
 
 ```bash
 pip install -r requirements.txt
@@ -29,11 +31,14 @@ pythonw midi_gui.py
 - **Цвета и яркость пэдов**: отправка цвета на железо, общий фейдер яркости всех 16 пэдов.
 - **Яркость монитора** через внешнюю программу автора DimTray — по именованному каналу Windows, а не горячими клавишами. DimTray в репозиторий не входит; без неё эти действия просто сообщают, что она не запущена.
 - **Живёт в трее**: крестик и сворачивание прячут окно в значок у часов, клик по значку возвращает, выход — пунктом «Выход» в его меню. Второй запуск не плодит копию, а показывает окно уже работающей.
+- **Перенос настроек**: «Настройки → Сохранить настройки в файл…» — одним JSON все назначения, цвета и яркость. На другом компьютере «Загрузить настройки из файла…»: перед заменой текущие копируются рядом, адрес контроллера не переносится (у каждого свой), а пути к программам, которых на новой машине нет, перечисляются в отчёте.
+- **Заряд контроллера** в шапке: читается из Battery Service `180F/2A19`, обновляется сам.
+- **Shift и Note Repeat** показаны на схеме, но назначить на них ничего нельзя: их обрабатывает прошивка, в компьютер они не передают ни байта (замер — docs/PROTOCOL.md §1).
 - **82 системных действия**: громкость, мьют микрофона, медиа-стоп, окна (свернуть / развернуть / закрыть), виртуальные рабочие столы, блокировка системы, скриншот, панель эмодзи, проводник, скролл и зум колесом, отмена и повтор, буфер обмена (копировать / вставить / вырезать), набор текста, произвольный хоткей, запуск программы, открытие папки, открытие URL, яркость пэдов, яркость монитора; браузер (вкладки, назад/вперёд, обновить, масштаб), Пуск / поиск / «Выполнить» / Параметры, история буфера, смена раскладки, погасить мониторы. На пэде с «Своей комбинацией» пишется сама комбинация, например `Ctrl+Shift+S`.
 
 ## Стек и архитектура
 - **Язык**: Python 3
-- **Библиотеки**: `tkinter` (GUI), `bleak` (BLE GATT), `pynput` (симуляция клавиатуры и мыши), `pycaw` + `comtypes` (системная громкость и мьют микрофона через `IAudioEndpointVolume`), `pystray` + `Pillow` (значок в трее), `asyncio`.
+- **Библиотеки**: `tkinter` + `customtkinter` (GUI; схема устройства на чистом Tk, шапка и панель — CTk), `bleak` (BLE GATT), `pynput` (симуляция клавиатуры и мыши), `pycaw` + `comtypes` (системная громкость и мьют микрофона через `IAudioEndpointVolume`), `pystray` + `Pillow` (значок в трее), `asyncio`.
 - **Архитектура**:
   - Main thread: `tkinter` mainloop (GUI).
   - Daemon thread: `asyncio` event loop для работы `bleak` (чтение нотификаций, отправка команд).
@@ -49,8 +54,9 @@ pythonw midi_gui.py
 - `mvave/dimtray.py` — яркость монитора через DimTray по именованному каналу.
 - `mvave/autostart.py` — автозапуск.
 - `mvave/tray.py` — значок в трее (pystray, свой поток; команды в GUI идут через очередь).
+- `mvave/theme.py` — палитра, шрифты, стиль списка действий.
 - `tests/` — `smoke_ui.py` (дымовой прогон интерфейса), `test_config.py`, `test_protocol.py`.
-- `tools/` — `make_icon.py`, `probe_color.py`, `smoke_vendor.py`: вспомогательные утилиты, не часть приложения.
+- `tools/` — `build_exe.py` (сборка `release/SMC-PAD.exe`), `make_icon.py`, `probe_color.py`, `smoke_vendor.py`: вспомогательные утилиты, не часть приложения.
 - `docs/PROTOCOL.md` — описание протокола устройства.
 - `midi_config.json` — сохранённые привязки, создаётся приложением. В git не хранится: там личные пути владельца.
 - `requirements.txt` — зависимости.
@@ -58,7 +64,13 @@ pythonw midi_gui.py
 - `mvave_icon.ico` — иконка приложения.
 - `LICENSE` — MIT.
 
-## Как запустить локально
+## Как запустить
+
+**Без Python.** Скачать `SMC-PAD.exe` из [Releases](https://github.com/eivl10/mvave-smc-pad/releases), положить в любую папку, запустить. Настройки программа хранит рядом с собой (`midi_config.json`), поэтому папка должна быть доступна на запись. Перенести настройки со старого компьютера: «Настройки → Загрузить настройки из файла…».
+
+Собрать exe самому: `pip install pyinstaller`, затем `python tools/build_exe.py`.
+
+**Из исходников:**
 1. Поставить зависимости: `pip install -r requirements.txt`.
 1. Убедиться, что M-Vave SMC-PAD включён и Bluetooth на ПК активен.
 2. Запустить `midi_gui.py` напрямую или через ярлык на рабочем столе (`create_shortcut.vbs` его создаёт или обновляет).
@@ -67,7 +79,7 @@ pythonw midi_gui.py
 Тесты запускаются из корня проекта; дымовой прогон интерфейса — `tests/smoke_ui.py`.
 
 ## Деплой
-Работает локально как desktop-приложение (скрипт).
+Desktop-приложение: скриптом из исходников или одним `SMC-PAD.exe` (PyInstaller, onefile). Exe выкладывается в GitHub Release, в git не хранится.
 
 ## Статус
 Рабочее приложение, используется владельцем ежедневно.
