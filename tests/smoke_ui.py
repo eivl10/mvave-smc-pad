@@ -908,6 +908,22 @@ def identify_renamed():
     return "«Выбор нажатием»"
 check("переключатель переименован", identify_renamed)
 
+def ctrl_d_any_layout():
+    # Русская раскладка: keysym «в», keycode тот же — 0x44 (VK_D)
+    assert "<Control-Key>" in root.bind() or "<Control-KeyPress>" in root.bind(), root.bind()
+    was = app._debug_visible
+    root.focus_force(); root.update()
+    # Кириллический keysym Tk синтезировать не умеет — чужая буква, код D
+    root.event_generate("<Control-KeyPress>", keysym="v", keycode=0x44, when="now")
+    root.update()
+    assert app._debug_visible != was, "Ctrl+D в русской раскладке не сработал"
+    app._on_ctrl_key(type("E", (), {"keycode": 0x44})())
+    assert app._debug_visible == was
+    app._on_ctrl_key(type("E", (), {"keycode": 0x43})())   # Ctrl+C — мимо
+    assert app._debug_visible == was
+    return "Ctrl+«в» открывает журнал"
+check("Ctrl+D работает в любой раскладке", ctrl_d_any_layout)
+
 def no_raw_private_use_glyphs():
     # Значки MDL2 в исходниках — только \uXXXX: сами символы частной области
     # в редакторе невидимы, а Edit-инструмент пишет их как есть.

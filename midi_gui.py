@@ -740,8 +740,9 @@ class App:
                                    font=("Consolas", 8), state=tk.DISABLED, wrap=tk.NONE,
                                    insertbackground="#00ff41")
         self._debug_text.pack(fill=tk.X, padx=2, pady=2)
-        self.root.bind("<Control-d>", self._toggle_debug)
-        self.root.bind("<Control-D>", self._toggle_debug)
+        # Ctrl+D по коду клавиши, а не по символу: в русской раскладке Tk
+        # присылает «в» (Cyrillic_ve), и привязка <Control-d> молчала.
+        self.root.bind("<Control-KeyPress>", self._on_ctrl_key)
 
     def _firmware_button(self, parent, text, tip):
         """Серая кнопка схемы, которую обрабатывает прошивка: не выбирается."""
@@ -2214,6 +2215,13 @@ class App:
     # ══════════════════════════════════════════════════════════════════════════
     #  DEBUG
     # ══════════════════════════════════════════════════════════════════════════
+    VK_D = 0x44
+
+    def _on_ctrl_key(self, event):
+        if getattr(event, "keycode", 0) == self.VK_D:
+            self._toggle_debug()
+            return "break"
+
     def _toggle_debug(self, event=None):
         self._debug_visible = not self._debug_visible
         if self._debug_visible:
