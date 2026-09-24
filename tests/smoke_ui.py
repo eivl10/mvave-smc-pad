@@ -46,6 +46,7 @@ root = tk.Tk()
 root.geometry("1200x700+3000+3000")     # за краем экрана, но настоящее окно
 root.update()
 app = midi_gui.App(root)
+root.geometry("+3000+3000")     # App ставит окно на экран — уводим обратно
 root.update()
 print(f"элементов на схеме: {len(app.ui_elements)}")
 print(f"дерево действий отображено: {bool(app._action_tree.winfo_ismapped())}")
@@ -177,6 +178,22 @@ def knob_wraparound():
     assert executed[-1][2] < 0, f"заворот ±64 сломан: {executed}"
     return executed[-1][2]
 check("заворот 0↔127 через ±64", knob_wraparound)
+
+def knob_rail_repeats_keep_moving():
+    # Контроллер упирается в 0/127. Повтор крайнего значения — шаг дальше.
+    for v, want in ((125, None), (126, 1), (127, 1), (127, 1), (127, 1), (0, None)):
+        executed.clear()
+        midi_gui.ble.msg_queue.put(f"cc:30:{v}")
+        app.check_queue(); root.update_idletasks()
+        if want is not None:
+            assert executed and executed[-1][2] == want, (v, executed)
+    app._prev_knob_cc.pop("knob_1", None)
+    executed.clear()
+    midi_gui.ble.msg_queue.put("cc:30:0"); app.check_queue()
+    midi_gui.ble.msg_queue.put("cc:30:0"); app.check_queue()
+    assert [e[2] for e in executed] == [-1, -1], executed
+    return "127,127,127 → +1 +1 +1; 0,0 → −1 −1"
+check("упор 0/127: повтор значения двигает дальше", knob_rail_repeats_keep_moving)
 
 print("\n── цикл обработки не должен умирать ────────────────────")
 def loop_survives_exception():
@@ -633,6 +650,276 @@ def theme_switch_roundtrip():
     midi_gui.ble.msg_queue.put("note:42:100"); app.check_queue()
     return f"{n} элементов, выделение и вкладка сохранены"
 check("тема: тёмная → светлая → тёмная на ходу", theme_switch_roundtrip)
+
+print("\n── 1.0: углы и крутилки ────────────────────────────────")
+def ctk_corners_are_images():
+    import customtkinter as ctk
+    from mvave import aa_shapes
+    f = ctk.CTkFrame(root, width=60, height=40, corner_radius=12, fg_color="#7c5cff")
+    f.place(x=0, y=0); root.update()
+    cv = f._canvas
+    ids = [i for i in cv.find_withtag("ctk_aa_circle_font_element")]
+    kinds = {cv.type(i) for i in ids}
+    assert ids and kinds == {"image"}, f"углы рисуются не картинкой: {kinds}"
+    assert any(cv.itemcget(i, "image") for i in ids), "у кругов пустые картинки"
+    f.configure(fg_color="#ff0000"); root.update()   # смена цвета перерисовывает
+    n = len(aa_shapes._cache)
+    f.destroy()
+    return f"{len(ids)} кругов-картинок, кэш {n}"
+check("углы CTk — сглаженные картинки", ctk_corners_are_images)
+
+def knob_frames_cached_and_endless():
+    k = app.ui_elements["knob_1"]["canvas"]
+    a0 = k.angle
+    k.rotate(-1000)                    # далеко за оборот: без упоров
+    assert k.angle == a0 + 5000
+    img = k.itemcget(k._img_id, "image")
+    k.rotate(72)                       # полный оборот → тот же кадр
+    assert k.itemcget(k._img_id, "image") == img, "кадр не из кэша по angle % 360"
+    k.rotate(1000 - 72)
+    return f"угол {k.angle:.0f}°, кадр {img}"
+check("крутилка: гладкий кадр, вращение без упоров", knob_frames_cached_and_endless)
+
+print("\n── 1.0: высота окна ────────────────────────────────────")
+def window_min_from_content():
+    root.update()
+    mw, mh = root.minsize()
+    assert mh >= root.winfo_reqheight(), (mh, root.winfo_reqheight())
+    # режим пары — самый высокий инспектор: низ кнопок не срезан
+    app.select_element("knob_7")
+    app._knob_mode_var.set("pair"); app._on_knob_mode_change(); root.update()
+    bf = app._btn_frame
+    assert bf.winfo_height() >= bf.winfo_reqheight(), "кнопки инспектора срезаны"
+    app._knob_mode_var.set("delta"); app._on_knob_mode_change(); root.update()
+    return f"минимум {mw}x{mh}"
+check("минимум окна считается от содержимого", window_min_from_content)
+
+def geometry_saved_only_when_normal():
+    appconfig.config.pop("window", None)
+    root.iconify(); root.update()
+    app._remember_geometry()
+    assert "window" not in appconfig.config, "запомнено свёрнутое окно"
+    root.deiconify(); root.geometry("+3000+3000"); root.update()
+    app._remember_geometry()
+    g = appconfig.config.get("window")
+    assert g and midi_gui.winplace.parse(g), g
+    assert "window" in appconfig._APP_KEYS, "пресет перенёс бы место окна"
+    return g
+check("место окна запоминается только в обычном состоянии", geometry_saved_only_when_normal)
+
+def offscreen_geometry_rejected():
+    assert not midi_gui.winplace.on_screen(-20000, -20000, 1320, 780)
+    assert midi_gui.winplace.parse("1320x780+-8+0") == (1320, 780, -8, 0)
+    return "окно за пределами мониторов не восстанавливается"
+check("сохранённое место вне экрана отбрасывается", offscreen_geometry_rejected)
+
+print("\n── 1.0: замок «влево / вправо» ─────────────────────────")
+def _pair_knob(uid, binding=None):
+    appconfig.config["bindings"][uid] = binding or {"mode": "pair"}
+    app.select_element(uid)
+    app._knob_mode_var.set("pair"); app._on_knob_mode_change(); root.update()
+
+def _pick(slot, action_id):
+    # Смена стороны выделяет её действие в дереве; <<TreeviewSelect>> нужно
+    # отработать ДО назначения, как при настоящем клике.
+    app._pair_slot.set(slot); app._on_pair_slot_change(); root.update()
+    app._assign_action(actions.get(action_id)); root.update()
+
+def lock_mirrors_opposite():
+    _pair_knob("knob_8")
+    assert midi_gui._pair_locked(appconfig.config["bindings"]["knob_8"]), "новый замок открыт"
+    _pick("cw", "media.next_track")
+    b = appconfig.config["bindings"]["knob_8"]
+    assert midi_gui._side(b, "ccw")["action"] == "media.prev_track", b
+    _pick("ccw", "browser.zoom_in")          # слева «больше» — справа «меньше»
+    assert midi_gui._side(b, "cw")["action"] == "browser.zoom_out", b
+    assert app._lock_btn.cget("text") == "\ue72e"
+    return f"{b['ccw']['action']} ↔ {b['cw']['action']}"
+check("замок: выбор стороны ставит противоположное", lock_mirrors_opposite)
+
+def lock_opens_without_pair():
+    _pair_knob("knob_8")
+    _pick("cw", "media.play_pause")
+    b = appconfig.config["bindings"]["knob_8"]
+    assert b["pair_lock"] is False and not midi_gui._pair_locked(b)
+    assert "ccw" not in b or not midi_gui._side(b, "ccw").get("action"), b
+    assert app._pair_hint.winfo_ismapped(), "нет подсказки про пару"
+    app._on_lock_toggle()                     # закрыть нельзя — пары нет
+    assert not midi_gui._pair_locked(b)
+    return "замок открылся, подсказка видна"
+check("действие без пары открывает замок", lock_opens_without_pair)
+
+def old_config_not_overwritten():
+    old = {"mode": "pair", "ccw": {"action": "edit.undo", "param": None},
+           "cw": {"action": "media.play_pause", "param": None}}
+    _pair_knob("knob_8", old)
+    assert not midi_gui._pair_locked(old), "замок закрылся на несвязанных сторонах"
+    _pick("ccw", "edit.redo")
+    b = appconfig.config["bindings"]["knob_8"]
+    assert midi_gui._side(b, "cw")["action"] == "media.play_pause", "чужая сторона переписана"
+    paired = {"mode": "pair", "ccw": "window.snap_left", "cw": "window.snap_right"}
+    assert midi_gui._pair_locked(paired), "противоположные стороны без ключа — замок закрыт"
+    return "несвязанные стороны целы, связанные — под замком"
+check("старый конфиг: замок не переписывает стороны", old_config_not_overwritten)
+
+def lock_toggle_closes_and_mirrors():
+    _pair_knob("knob_8", {"mode": "pair", "pair_lock": False,
+                          "cw": {"action": "desktop.right", "param": None}})
+    app._pair_slot.set("cw")
+    app._on_lock_toggle()
+    b = appconfig.config["bindings"]["knob_8"]
+    assert b["pair_lock"] is True and midi_gui._side(b, "ccw")["action"] == "desktop.left", b
+    app._on_lock_toggle()
+    assert b["pair_lock"] is False
+    return "закрытие замка дописало вторую сторону"
+check("закрыть замок вручную", lock_toggle_closes_and_mirrors)
+
+def opposite_table_symmetric():
+    for a, b in actions.OPPOSITE.items():
+        assert actions.OPPOSITE[b] == a, (a, b)
+        assert actions.get(a) and actions.get(a).kind == "trigger" and not actions.get(a).param_kind, a
+    return f"{len(actions.OPPOSITE) // 2} пар"
+check("таблица пар симметрична и без параметров", opposite_table_symmetric)
+
+print("\n── 1.0: автозапуск (тестовый ключ реестра) ─────────────")
+def autostart_toggle_writes_registry():
+    import winreg
+    from mvave import autostart
+    real_key = autostart.RUN_KEY
+    autostart.RUN_KEY = r"Software\mvave-smc-pad-smoke\Run"
+    try:
+        app._open_settings_menu(); root.update()
+        assert not app._autostart_var.get(), "на пустом ключе галка включена"
+        app._autostart_var.set(True); app._on_autostart_toggle()
+        assert autostart.state() == "on" and autostart.recorded() == autostart.command()
+        assert autostart.command().endswith("--tray")
+        # exe переехал: в реестре другой путь → галка выключена
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, autostart.RUN_KEY) as k:
+            winreg.SetValueEx(k, autostart.APP_NAME, 0, winreg.REG_SZ, '"C:\\old\\SMC-PAD.exe" --tray')
+        assert autostart.state() == "other"
+        dialogs.PopupMenu._current._born = False
+        dialogs.PopupMenu.close_current(); root.update()
+        app._open_settings_menu(); root.update()
+        assert not app._autostart_var.get(), "другой путь показан включённым"
+        app._autostart_var.set(True); app._on_autostart_toggle()
+        assert autostart.state() == "on", "путь не перезаписан"
+        app._autostart_var.set(False); app._on_autostart_toggle()
+        assert autostart.state() == "off" and autostart.recorded() == ""
+        dialogs.PopupMenu._current._born = False
+        dialogs.PopupMenu.close_current(); dialogs._toast_close(); root.update()
+        return autostart.command()[-40:]
+    finally:
+        autostart.RUN_KEY = real_key
+        for sub in (r"Software\mvave-smc-pad-smoke\Run", r"Software\mvave-smc-pad-smoke"):
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, sub)
+            except OSError:
+                pass
+check("галка автозапуска пишет и стирает значение", autostart_toggle_writes_registry)
+
+def tray_start_falls_back_to_window():
+    class NoIcon:
+        visible = False
+        def stop(self): pass
+    real = app._tray._icon
+    app._tray._icon = NoIcon()
+    try:
+        app.start_in_tray(); root.update()
+        assert root.state() == "withdrawn", "--tray не спрятал окно"
+        import time
+        t0 = time.time()
+        while root.state() == "withdrawn" and time.time() - t0 < 3:
+            root.update(); time.sleep(0.05)
+        assert root.state() == "normal", "значка нет, а окно осталось спрятанным"
+    finally:
+        app._tray._icon = real
+        root.geometry("+3000+3000"); root.update()
+    return "значок не появился → окно показано"
+check("--tray без значка в трее показывает окно", tray_start_falls_back_to_window)
+
+print("\n── 1.0: имена, банки, справка ──────────────────────────")
+def latin_names_everywhere():
+    assert app._name("pad_6") == "PAD 6" and app._name("knob_6") == "KNOB 6"
+    assert app._name("btn_6") == "BUTTON PLAY"
+    app.select_element("knob_2"); root.update()
+    assert app._insp_header.cget("text") == "KNOB 2"
+    app.select_element("btn_4"); root.update()
+    assert app._insp_header.cget("text") == "BUTTON"
+    assert app._insp_header_icon.cget("text") == "\ue892"
+    assert "knob_2" in app.ui_elements, "uid поменялся"
+    for v in (40, 41):
+        midi_gui.ble.msg_queue.put(f"cc:31:{v}")
+    app.check_queue(); root.update_idletasks()
+    txt = app.last_input_var.get()
+    assert txt == "KNOB 2 · CC 31 · 41", txt
+    return txt
+check("имена латиницей, uid прежние", latin_names_everywhere)
+
+def transport_glyphs_distinct():
+    g = [app.ui_elements[f"btn_{n}"]["icon"] for n in range(4, 9)]
+    assert len(set(g)) == 5, f"значки повторяются: {g}"
+    assert all(0xE000 <= ord(c) <= 0xF8FF for c in g), "не MDL2"
+    assert app.ui_elements["btn_4"]["icon_lbl"].cget("font").startswith("{Segoe MDL2")
+    return " ".join(f"U+{ord(c):04X}" for c in g)
+check("назад / вперёд не путаются с play", transport_glyphs_distinct)
+
+def bank_label_neutral():
+    app._set_bank(5); root.update()
+    assert app._bank_var.get().startswith("Pad bank 5")
+    midi_gui.ble.msg_queue.put("cc:40:10"); app.check_queue()
+    assert app._bank_var.get() == "Pad bank 5 · Knob bank 2", app._bank_var.get()
+    midi_gui.ble.msg_queue.put("cc:32:10"); app.check_queue()
+    assert app._bank_var.get().endswith("Knob bank 1")
+    app._set_bank(3)
+    return app._bank_var.get()
+check("банки: нейтральная подпись Pad / Knob bank", bank_label_neutral)
+
+def help_opens_all_sections():
+    from mvave import help_text
+    seen = {}
+    def grab():
+        m = app._help_modal
+        texts = []
+        def walk(w):
+            for c in w.winfo_children():
+                if isinstance(c, tk.Label):
+                    texts.append(c.cget("text"))
+                walk(c)
+        walk(m.win)
+        seen["n"] = sum(1 for t in texts if any(t.endswith(s) for s, _ in help_text.SECTIONS))
+        m.close(None)
+    root.after(300, grab)
+    app._open_help()
+    assert seen.get("n") == len(help_text.SECTIONS) == 12, seen
+    return f"{seen['n']} разделов"
+check("справка открывается, 12 разделов", help_opens_all_sections)
+
+def identify_renamed():
+    texts = []
+    def walk(w):
+        for c in w.winfo_children():
+            try:
+                texts.append(c.cget("text"))
+            except Exception:
+                pass
+            walk(c)
+    walk(root)
+    assert "Выбор нажатием" in texts and "Определить" not in texts
+    return "«Выбор нажатием»"
+check("переключатель переименован", identify_renamed)
+
+def no_raw_private_use_glyphs():
+    # Значки MDL2 в исходниках — только \uXXXX: сами символы частной области
+    # в редакторе невидимы, а Edit-инструмент пишет их как есть.
+    import glob, re
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    files = [os.path.join(base, "midi_gui.py")] + [
+        f for d in ("mvave", "tests", "tools") for f in glob.glob(os.path.join(base, d, "*.py"))]
+    bad = [os.path.basename(f) for f in files
+           if re.search("[\ue000-\uf8ff]", open(f, encoding="utf-8").read())]
+    assert not bad, f"сырые символы U+E000–U+F8FF: {bad}"
+    return f"{len(files)} файлов чистые"
+check("в .py нет сырых значков частной области", no_raw_private_use_glyphs)
 
 root.destroy()
 

@@ -121,7 +121,7 @@ _MACHINE_KEYS = ("ble_address",)
 # Настройки самой программы, а не раскладки: смена пресета не должна
 # перекрашивать окно. Свои цвета палитры при этом не теряются, а
 # объединяются с пришедшими — см. import_config.
-_APP_KEYS = ("theme",)
+_APP_KEYS = ("theme", "window")   # window — размер и место окна этой машины
 EXPORT_MARK = "mvave-smc-pad"
 MAX_CUSTOM_COLORS = 16
 

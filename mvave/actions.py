@@ -419,6 +419,32 @@ CATEGORY_ORDER = ["Медиа", "Звук", "Подсветка", "Окна", "�
 def get(action_id: str) -> Optional[Action]:
     return ACTIONS.get(action_id)
 
+# Пары для замка «влево / вправо»: выбор одной стороны ставит на другую
+# противоположное. Первое в паре — «назад / меньше / вниз» (влево, против
+# часовой), второе — «вперёд / больше / вверх» (вправо). Сверено со всем
+# списком действий: других пар в нём нет, а параметра нет ни у одной пары.
+_PAIRS = [
+    ("media.prev_track", "media.next_track"),
+    ("media.volume_down", "media.volume_up"),
+    ("window.snap_left", "window.snap_right"),
+    ("window.monitor_left", "window.monitor_right"),
+    ("window.minimize", "window.maximize"),
+    ("desktop.left", "desktop.right"),
+    ("browser.prev_tab", "browser.next_tab"),
+    ("browser.back", "browser.forward"),
+    ("browser.zoom_out", "browser.zoom_in"),
+    ("edit.undo", "edit.redo"),
+    ("pads.brightness_down", "pads.brightness_up"),
+    ("monitor.brightness_down", "monitor.brightness_up"),
+]
+OPPOSITE = {**{a: b for a, b in _PAIRS}, **{b: a for a, b in _PAIRS}}
+
+
+def opposite(action_id):
+    """Противоположное действие или None, если пары нет."""
+    return OPPOSITE.get(action_id)
+
+
 def for_kind(kind: str) -> list[Action]:
     return [a for a in ACTIONS_LIST if a.kind == kind]
 

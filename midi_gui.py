@@ -15,6 +15,9 @@ from mvave import tray
 from mvave import theme
 from mvave import dialogs
 from mvave import presets
+from mvave import knob_art
+from mvave import winplace
+from mvave import autostart
 
 import customtkinter as ctk
 
@@ -38,6 +41,22 @@ KNOB_CC_MAP = {
     38: 1, 39: 2, 40: 3, 41: 4, 42: 5, 43: 6, 44: 7, 45: 8,
 }
 CC_TO_KNOB = KNOB_CC_MAP
+# Крайние значения CC крутилки → шаг, если контроллер повторяет их на упоре
+RAIL = {0: -1, 127: +1}
+
+# Транспортные кнопки корпуса (btn_4..btn_8): назад, вперёд, play, пауза,
+# запись. Надписей на корпусе нет — в программе значок и латинское слово.
+BTN_GLYPHS = {4: "\ue892", 5: "\ue893", 6: "\ue768", 7: "\ue769", 8: "\ue7c8"}
+BTN_WORDS = {4: "PREV", 5: "NEXT", 6: "PLAY", 7: "PAUSE", 8: "REC"}
+
+BANK_HINT = (
+    "Банки переключаются кнопками на корпусе.\n"
+    "PAD BANK меняет диапазон нот пэдов: банков 8 (4-й и 8-й шлют одни и те же "
+    "ноты). KNOB BANK переключает крутилки между двумя наборами CC.\n"
+    "Программа узнаёт банк по пришедшей ноте или CC. Номер банка пэдов нужен ей "
+    "самой: от него зависит адрес, по которому цвет записывается на пэд.\n"
+    "Назначения одинаковы во всех банках."
+)
 
 # ── Color presets for the pad palette ─────────────────────────────────────────
 COLOR_PRESETS = [
@@ -110,6 +129,23 @@ def _side(binding, slot):
     if isinstance(v, str) and v:
         return {"action": v, "param": None}
     return {}
+
+
+def _pair_locked(binding):
+    """Замок сторон закрыт? Явное значение pair_lock главнее.
+
+    Старый конфиг без ключа: замок закрыт, только если стороны уже
+    противоположны (или обе пусты). Иначе открыт — чужую настройку, где
+    стороны заданы независимо, замок не переписывает.
+    """
+    b = binding or {}
+    if "pair_lock" in b:
+        return bool(b["pair_lock"])
+    ccw = _side(b, "ccw").get("action")
+    cw = _side(b, "cw").get("action")
+    if not ccw and not cw:
+        return True
+    return bool(ccw) and actions.opposite(ccw) == cw
 
 
 _HOTKEY_NAMES = {
@@ -241,14 +277,21 @@ class _TkClipboard:
 
 
 class UIKnob(tk.Canvas):
-    """Endless encoder visual — indicator rotates freely, no min/max."""
+    """Endless encoder visual — indicator rotates freely, no min/max.
+
+    Кадр — сглаженная картинка из mvave.knob_art: tk-овалы рисовали кольцо
+    ступеньками. Угол не ограничен, кадр берётся по angle % 360.
+    """
     def __init__(self, parent, size=50, bg_col=None):
-        super().__init__(parent, width=size, height=size, bg=bg_col or theme.SURFACE,
+        self._bg = bg_col or theme.SURFACE
+        super().__init__(parent, width=size, height=size, bg=self._bg,
                          highlightthickness=0)
         self.size = size
         self.angle = 225.0  # Current angle in degrees (starts at 7 o'clock)
-        self.center = size // 2
-        self.radius = size // 2 - 4
+        # Цвета читаются при создании: крутилки пересоздаются при смене темы
+        self._colors = (self._bg, theme.KNOB_BODY, theme.KNOB_RING,
+                        theme.KNOB_TICK, theme.ACCENT)
+        self._img_id = self.create_image(0, 0, anchor="nw")
         self.draw()
 
     def rotate(self, delta):
@@ -257,20 +300,8 @@ class UIKnob(tk.Canvas):
         self.draw()
 
     def draw(self):
-        self.delete("all")
-        # Knob body
-        self.create_oval(self.center - self.radius, self.center - self.radius,
-                         self.center + self.radius, self.center + self.radius,
-                         fill=theme.KNOB_BODY, outline=theme.KNOB_RING, width=2)
-        # Indicator line
-        angle_rad = math.radians(self.angle)
-        ix = self.center + (self.radius - 2) * math.cos(angle_rad)
-        iy = self.center - (self.radius - 2) * math.sin(angle_rad)
-        self.create_line(self.center, self.center, ix, iy, fill=theme.KNOB_TICK, width=2)
-        # Dot at tip
-        dot_r = 2
-        self.create_oval(ix - dot_r, iy - dot_r, ix + dot_r, iy + dot_r,
-                         fill=theme.ACCENT, outline="")
+        self.itemconfigure(self._img_id, image=knob_art.frame(
+            self, self.size, self.angle, *self._colors))
 
 
 class ToolTip:
@@ -321,8 +352,10 @@ class App:
         self.root = root
         self._last_note_time = {}  # uid -> float
         self.root.title("M-Vave SMC-PAD Controller")
-        self.root.geometry("1320x780")
-        self.root.minsize(1180, 700)
+        # Размер и место ставит _place_window после сборки: минимум считается
+        # от содержимого, а не числом (при 1320x780 низ инспектора срезался).
+        self._geom_job = None
+        self._placed = False
         self.root.configure(bg="#111")
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mvave_icon.ico")
         if os.path.exists(icon_path):
@@ -348,6 +381,7 @@ class App:
         self._prev_knob_cc = {}  # uid → previous absolute CC value for delta calc
         self._volume_osd = None  # индикатор громкости: None — ещё не создан, False — сбой
         self._current_bank = 3  # default bank
+        self._knob_bank = 1     # по CC крутилок: 30-37 — 1, 38-45 — 2
         self._identify_mode = False
         self._learn_uid = None   # элемент, ждущий привязки к CC/ноте
         self._color_ok = False   # вендорский канал цвета доступен
@@ -364,6 +398,8 @@ class App:
 
         self._apply_theme(appconfig.config.get("theme", "dark"))
         self.build_ui()
+        self._place_window()
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
 
         # Сбой в ЛЮБОМ обработчике Tk — в панель Ctrl+D, а не в stderr.
         # Под pythonw (а ярлык запускает именно его) sys.stderr равен None,
@@ -459,7 +495,7 @@ class App:
         self.status_var.set(status)
         self.last_input_var.set(last_input)
         self._set_battery(battery if battery is not None else -1)
-        self._bank_var.set(f"Банк {self._current_bank}")
+        self._bank_var.set(self._bank_text())
         self.load_hardware_mapping()
         self.update_ui_from_config()
         if sel in self.ui_elements:
@@ -497,22 +533,30 @@ class App:
         self._battery_lbl.pack(side=tk.LEFT)
         self._draw_battery()
 
-        self._bank_var = tk.StringVar(value="Банк 3")
-        tk.Label(row1, textvariable=self._bank_var, fg=theme.WARN, bg=theme.SURFACE_2,
-                 font=theme.F_SMALL, padx=10, pady=2).pack(side=tk.LEFT, padx=(18, 0))
+        # Банки — справка, а не тревога: нейтральная подпись без плашки.
+        self._bank_var = tk.StringVar(value=self._bank_text())
+        bank_lbl = tk.Label(row1, textvariable=self._bank_var, fg=theme.MUTED,
+                            bg=theme.SURFACE, font=theme.F_SMALL)
+        bank_lbl.pack(side=tk.LEFT, padx=(18, 0))
+        ToolTip(bank_lbl, lambda: BANK_HINT)
 
         if appconfig.last_error:
             self._lbl(row1, appconfig.last_error, fg=theme.WARN).pack(
                 side=tk.LEFT, padx=10)
 
         self._identify_var = tk.BooleanVar(value=False)
-        ctk.CTkSwitch(row1, text="Определить", variable=self._identify_var,
-                      onvalue=True, offvalue=False, command=self._on_identify_toggle,
-                      font=theme.C_SMALL, text_color=theme.MUTED,
-                      progress_color=theme.ACCENT, button_color="#ffffff",
-                      button_hover_color="#ffffff",
-                      fg_color=theme.SURFACE_3, switch_width=34, switch_height=18,
-                      width=110).pack(side=tk.LEFT, padx=(18, 0))
+        # Пока включён, нажатие контрола выделяет его на схеме и НЕ выполняет
+        # действие — так ищут, где на схеме физическая кнопка.
+        pick_sw = ctk.CTkSwitch(row1, text="Выбор нажатием", variable=self._identify_var,
+                                onvalue=True, offvalue=False,
+                                command=self._on_identify_toggle,
+                                font=theme.C_SMALL, text_color=theme.MUTED,
+                                progress_color=theme.ACCENT, button_color="#ffffff",
+                                button_hover_color="#ffffff",
+                                fg_color=theme.SURFACE_3, switch_width=34, switch_height=18)
+        pick_sw.pack(side=tk.LEFT, padx=(18, 0))
+        ToolTip(pick_sw, lambda: "Нажмите контрол на устройстве — он выделится "
+                                 "справа, действие не выполнится.")
 
         # Пока ждём сигнал для привязки — это видно в шапке, а не только
         # мелкой строкой в инспекторе.
@@ -522,6 +566,9 @@ class App:
         self._settings_btn = self._btn(row1, "Настройки  ▾", self._open_settings_menu,
                                        width=124, height=32)
         self._settings_btn.pack(side=tk.RIGHT)
+        self._help_btn = dialogs.icon_button(row1, "\ue946", self._open_help, size=32)
+        self._help_btn.pack(side=tk.RIGHT, padx=(0, 8))
+        ToolTip(self._help_btn, lambda: "Справка")
 
         self.last_input_var = tk.StringVar(value="")
         self._lbl(row1, fg=theme.MUTED, font=theme.F_SMALL,
@@ -607,7 +654,7 @@ class App:
             f.pack()
             f.pack_propagate(False)
 
-            lbl_num = tk.Label(f, text=f"PAD{num}", fg="#777", bg="#222",
+            lbl_num = tk.Label(f, text=f"PAD {num}", fg="#777", bg="#222",
                                font=(theme.FONT, 7, "bold"))
             lbl_num.pack(anchor="nw", padx=4, pady=3)
             lbl_act = tk.Label(f, text="", fg="white", bg="#222",
@@ -636,13 +683,13 @@ class App:
             ("fw", "PAD BANK", "Банк пэдов. " + fw + " Номер банка программа узнаёт "
                                "по нотам и показывает в шапке."),
             ("fw", "KNOB BANK", "Банк крутилок. " + fw),
-            (4, "◀", None),
-            (5, "▶", None),
-            (6, "▶", None),
-            # ⏸ и ⏺ Tkinter на Windows рисует пустым квадратом — проверено на
-            # снимке окна. Берём глифы из базового набора Segoe UI.
-            (7, "‖", None),
-            (8, "●", None),
+            # Значки — Segoe MDL2 Assets. Назад / вперёд — «предыдущий /
+            # следующий» (|◀ ▶|): одиночные ◀ ▶ путались с play.
+            (4, BTN_GLYPHS[4], None),
+            (5, BTN_GLYPHS[5], None),
+            (6, BTN_GLYPHS[6], None),
+            (7, BTN_GLYPHS[7], None),
+            (8, BTN_GLYPHS[8], None),
             ("fw", "SHIFT", "Shift. " + fw + " Shift+пэд — пресеты, чувствительность, октава."),
             ("fw", "NOTE REPEAT", "Note Repeat. " + fw),
         ]
@@ -669,7 +716,7 @@ class App:
             lbl_num = tk.Label(f, text="", fg=theme.DIM, bg=bg, font=(theme.FONT, 7))
             lbl_num.pack(side=tk.LEFT, padx=(8, 0))
             lbl_icon = tk.Label(f, text=icon, fg=theme.BTN_ICON, bg=bg, anchor="w",
-                                font=(theme.FONT, 11, "bold"))
+                                font=(theme.ICON_FONT, 12))
             lbl_icon.pack(side=tk.LEFT)
             lbl_act = tk.Label(f, text="", fg=theme.OK, bg=bg, anchor="e",
                                font=theme.F_TINY)
@@ -757,6 +804,9 @@ class App:
         m.item("Экспорт в файл", self._on_export, "\ue898")
         m.item("Импорт из файла", self._on_import, "\ue896")
         m.item("Открыть папку с настройками", self._on_open_config_dir, "\ue838")
+        m.item("Ярлык на рабочем столе", self._on_desktop_shortcut, "\ue8a7")
+        m.separator()
+        self._autostart_row(m.body)
         m.separator()
         m.caption("Тема")
         names = {v: k for k, v in theme.MODE_NAMES.items()}
@@ -769,6 +819,62 @@ class App:
         seg.set(theme.MODE_NAMES[theme.mode])
         seg.pack(fill=tk.X, padx=8, pady=(0, 8))
         m.show_below(self._settings_btn)
+
+    # ── Автозапуск и ярлык ────────────────────────────────────────────────────
+    def _autostart_row(self, parent):
+        """Переключатель автозапуска. Состояние читается из реестра при каждом
+        открытии меню: значение могли удалить снаружи, а exe — перенести."""
+        E = theme.ELEVATED
+        row = tk.Frame(parent, bg=E)
+        row.pack(fill=tk.X, padx=12, pady=(4, 2))
+        st = autostart.state()
+        self._autostart_var = tk.BooleanVar(value=st == "on")
+        ctk.CTkSwitch(row, text="Запускать вместе с Windows", variable=self._autostart_var,
+                      command=self._on_autostart_toggle, font=theme.C_SMALL,
+                      text_color=theme.TEXT, progress_color=theme.ACCENT,
+                      button_color="#ffffff", button_hover_color="#ffffff",
+                      fg_color=theme.SURFACE_3, switch_width=36,
+                      switch_height=18).pack(side=tk.LEFT)
+        note = ("Записан другой путь — включи, чтобы запускать эту копию"
+                if st == "other" else "Окно откроется спрятанным в трей")
+        tk.Label(parent, text=note, fg=theme.WARN if st == "other" else theme.MUTED,
+                 bg=E, font=theme.F_TINY, anchor="w", justify=tk.LEFT,
+                 wraplength=240).pack(fill=tk.X, padx=12, pady=(0, 4))
+
+    def _on_autostart_toggle(self):
+        want = bool(self._autostart_var.get())
+        try:
+            st = autostart.set_autostart(want)
+        except OSError as e:
+            self._autostart_var.set(not want)
+            dialogs.toast(self.root, f"Автозапуск не изменён: {e}", kind="error")
+            return
+        if (st == "on") != want:
+            self._autostart_var.set(st == "on")
+            dialogs.toast(self.root, "Автозапуск не записался в реестр", kind="error")
+            return
+        dialogs.toast(self.root, "Автозапуск включён" if want else "Автозапуск выключен")
+        legacy = autostart.legacy_startup_shortcut()
+        if want and legacy:
+            # Старый ярлык из «Автозагрузки» вместе с реестром запустил бы
+            # программу дважды. Удалять — только с согласия.
+            dialogs.PopupMenu.close_current()
+            if dialogs.confirm(self.root, "Удалить старый ярлык автозагрузки?",
+                               f"Раньше автозапуск шёл через ярлык:\n{legacy}\n\n"
+                               "Теперь он записан в реестр, а ярлык запустил бы "
+                               "программу второй раз.", ok_text="Удалить"):
+                try:
+                    os.remove(legacy)
+                except OSError as e:
+                    dialogs.alert(self.root, "Ярлык не удалён", str(e), kind="error")
+
+    def _on_desktop_shortcut(self):
+        try:
+            path = autostart.create_desktop_shortcut()
+        except Exception as e:
+            dialogs.alert(self.root, "Ярлык не создан", str(e), kind="error")
+            return
+        dialogs.toast(self.root, "Ярлык создан: " + os.path.basename(path))
 
     def _after_config_replaced(self):
         """Настройки заменены целиком — привести окно и железо к ним."""
@@ -835,6 +941,29 @@ class App:
             return None
         dialogs.toast(self.root, f"Пресет «{name}» сохранён")
         return name
+
+    def _open_help(self):
+        """Справка: разделы из mvave.help_text в прокручиваемом окне."""
+        from mvave import help_text
+        E = theme.ELEVATED
+        m = dialogs.Modal(self.root, "Справка", width=560)
+        area = ctk.CTkScrollableFrame(
+            m.body, fg_color=E, height=min(460, int(self.root.winfo_height() * 0.6)),
+            scrollbar_button_color=theme.SURFACE_3,
+            scrollbar_button_hover_color=theme.DIM, corner_radius=0)
+        area.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        wrap = 560 - 2 * dialogs.PAD - 40
+        for i, (title, paras) in enumerate(help_text.SECTIONS, 1):
+            tk.Label(area, text=f"{i}. {title}", fg=theme.TEXT, bg=E,
+                     font=theme.F_BOLD, anchor="w").pack(fill=tk.X, pady=(12 if i > 1 else 0, 4))
+            for p in paras:
+                tk.Label(area, text=p, fg=theme.MUTED, bg=E, font=theme.F_SMALL,
+                         anchor="w", justify=tk.LEFT, wraplength=wrap).pack(
+                    fill=tk.X, pady=(0, 6))
+        self._help_modal = m
+        m.buttons([("Закрыть", None, "primary")])
+        m.show()
+        self._help_modal = None
 
     def _open_presets(self):
         """Окно со списком пресетов: открыть или удалить без выбора файла."""
@@ -964,9 +1093,15 @@ class App:
         self._inspector_frame = insp
 
         # === 1. Заголовок ===
-        self._insp_header = tk.Label(insp, text="Ничего не выбрано", fg=theme.TEXT,
+        head = tk.Frame(insp, bg=S)
+        head.pack(fill=tk.X)
+        self._insp_header = tk.Label(head, text="Ничего не выбрано", fg=theme.TEXT,
                                      bg=S, font=theme.F_TITLE, anchor="w")
-        self._insp_header.pack(fill=tk.X)
+        self._insp_header.pack(side=tk.LEFT)
+        # Значок кнопки — Segoe MDL2, в шрифте заголовка его нет
+        self._insp_header_icon = tk.Label(head, text="", fg=theme.TEXT, bg=S,
+                                          font=(theme.ICON_FONT, 15))
+        self._insp_header_icon.pack(side=tk.LEFT, padx=(10, 0))
         self._insp_hint = tk.Label(
             insp, text="Нажми пэд, крутилку или кнопку на схеме слева —\n"
                        "здесь появится, что она делает.",
@@ -1012,6 +1147,13 @@ class App:
             self._knob_mode_frame, list(self._knob_mode_names.values()),
             self._on_knob_mode_seg)
         self._knob_mode_seg.pack(fill=tk.X)
+        # Подсказка режима «Плавно»; последняя в рамке — pack без before
+        self._delta_hint = tk.Label(
+            self._knob_mode_frame,
+            text="Действия этого режима уже работают в обе стороны. "
+                 "«Влево / вправо» — для действий-нажатий.",
+            fg=theme.MUTED, bg=S, font=theme.F_TINY, anchor="w", justify=tk.LEFT,
+            wraplength=340)
         # Переключатель — только отображение. Источник правды — переменная:
         # её выставляют select_element и тесты, трасса держит кнопку в согласии.
         self._knob_mode_var.trace_add("write", lambda *a: self._knob_mode_seg.set(
@@ -1022,6 +1164,20 @@ class App:
         self._pair_frame = tk.Frame(self._insp_content, bg=S)
         self._pair_slot = tk.StringVar(value="ccw")  # which slot is being assigned
         for value, text in (("ccw", "◀ Влево"), ("cw", "Вправо ▶")):
+            if value == "cw":
+                # Замок между сторонами: закрыт — стороны зеркалят друг друга
+                lock_row = tk.Frame(self._pair_frame, bg=S)
+                lock_row.pack(fill=tk.X, pady=1)
+                self._lock_btn = dialogs.icon_button(lock_row, "\ue72e",
+                                                     self._on_lock_toggle, size=26)
+                self._lock_btn.pack(side=tk.LEFT, padx=(24, 8))
+                self._lock_lbl = tk.Label(lock_row, text="", fg=theme.MUTED, bg=S,
+                                          font=theme.F_TINY, anchor="w")
+                self._lock_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                ToolTip(self._lock_btn, lambda: (
+                    "Замок закрыт: выбери действие на одной стороне — на другую "
+                    "встанет противоположное.\nЗамок открыт: стороны настраиваются "
+                    "отдельно."))
             row = tk.Frame(self._pair_frame, bg=S)
             row.pack(fill=tk.X, pady=1)
             ctk.CTkRadioButton(row, text=text, variable=self._pair_slot, value=value,
@@ -1037,6 +1193,12 @@ class App:
                 self._pair_ccw_lbl = lbl
             else:
                 self._pair_cw_lbl = lbl
+        # Последний в рамке сторон — pack без before ставит его в конец
+        self._pair_hint = tk.Label(
+            self._pair_frame, text="У этого действия нет пары — второе направление "
+                                   "настраивается отдельно.",
+            fg=theme.MUTED, bg=S, font=theme.F_TINY, anchor="w", justify=tk.LEFT,
+            wraplength=340)
 
         # === 2c. Вкладки пэда: «Действие» / «Цвет» ===
         self._tab_seg = self._segmented(self._insp_content, ["Действие", "Цвет"],
@@ -1065,7 +1227,10 @@ class App:
         # === 4. Список действий ===
         tree_frame = tk.Frame(self._tab_action, bg=theme.SURFACE_2)
         tree_frame.pack(fill=tk.BOTH, expand=True)
-        self._action_tree = ttk.Treeview(tree_frame, height=12, show="tree",
+        # height — минимум, а не размер: список растягивается на всё
+        # свободное место. При 12 строках список не сжимался, и в режиме
+        # «Влево / вправо» кнопки внизу инспектора срезались краем окна.
+        self._action_tree = ttk.Treeview(tree_frame, height=5, show="tree",
                                          selectmode="browse")
         tree_scroll = ctk.CTkScrollbar(tree_frame, command=self._action_tree.yview,
                                        fg_color=theme.SURFACE_2,
@@ -1385,6 +1550,7 @@ class App:
         el = self.ui_elements[uid]
         if el["type"] == "knob" and self._knob_mode_var.get() == "pair":
             key = "ccw" if self._pair_slot.get() == "ccw" else "cw"
+            locked = _pair_locked(bindings[uid])   # до записи: она меняет вывод
             prev = _side(bindings[uid], key)
             # Параметр сохраняем, только если действие то же самое.
             keep = prev.get("param") if prev.get("action") == act.id else None
@@ -1392,6 +1558,18 @@ class App:
                 "action": act.id,
                 "param": keep if keep is not None else _initial_param(act),
             }
+            if locked:
+                # Замок: на другую сторону — противоположное. Параметр у
+                # стороны свой (FIXES «_side»), у пар из OPPOSITE его нет.
+                other = "cw" if key == "ccw" else "ccw"
+                opp = actions.opposite(act.id)
+                if opp:
+                    bindings[uid][other] = {"action": opp, "param": None}
+                elif act.id == "none":
+                    bindings[uid].pop(other, None)
+                else:
+                    locked = False           # пары нет — замок открывается сам
+            bindings[uid]["pair_lock"] = locked
             bindings[uid]["mode"] = "pair"
             self._update_pair_labels()
             target = bindings[uid][key]
@@ -1441,6 +1619,8 @@ class App:
             current_action = b.get("action")
         self._populate_tree(select_action_id=current_action)
         self._update_pair_labels()
+        self._update_mode_hint()
+        self.root.after_idle(self._fit_inspector)
 
     def _on_pair_slot_change(self):
         """When user switches pair slot, highlight current action in tree."""
@@ -1458,6 +1638,35 @@ class App:
                 pass
         # Поле параметра принадлежит выбранной стороне, а не крутилке целиком.
         self._show_param_for_action(act, side)
+        self._update_pair_labels()
+
+    def _on_lock_toggle(self):
+        """Открыть или закрыть замок сторон.
+
+        Закрытие зеркалит выбранную сторону на другую. Если у действия нет
+        пары, замок не закрывается — подсказка под строками объясняет почему.
+        """
+        uid = self.current_sel
+        if not uid:
+            return
+        b = appconfig.config["bindings"].setdefault(uid, {})
+        if _pair_locked(b):
+            b["pair_lock"] = False
+        else:
+            key = "ccw" if self._pair_slot.get() == "ccw" else "cw"
+            other = "cw" if key == "ccw" else "ccw"
+            a = _side(b, key).get("action") or _side(b, other).get("action")
+            if a and a != "none":
+                src = key if _side(b, key).get("action") else other
+                opp = actions.opposite(a)
+                if not opp:
+                    self._update_pair_labels()
+                    return
+                b["cw" if src == "ccw" else "ccw"] = {"action": opp, "param": None}
+            b["pair_lock"] = True
+        appconfig.save_config()
+        self._update_pair_labels()
+        self.update_ui_from_config()
 
     def _update_pair_labels(self):
         if not self.current_sel:
@@ -1467,6 +1676,24 @@ class App:
         cw_act = actions.get(_side(b, "cw").get("action") or "")
         self._pair_ccw_lbl.config(text=ccw_act.label if ccw_act else "—")
         self._pair_cw_lbl.config(text=cw_act.label if cw_act else "—")
+
+        locked = _pair_locked(b)
+        self._lock_btn.configure(text="\ue72e" if locked else "\ue785",
+                                 text_color=theme.ACCENT if locked else theme.MUTED)
+        self._lock_lbl.config(text="Связаны: вторая сторона — противоположное"
+                              if locked else "Стороны настраиваются отдельно")
+        key = "ccw" if self._pair_slot.get() == "ccw" else "cw"
+        a = _side(b, key).get("action")
+        if not locked and a and a != "none" and not actions.opposite(a):
+            self._pair_hint.pack(fill=tk.X, pady=(2, 0))
+        else:
+            self._pair_hint.pack_forget()
+
+    def _update_mode_hint(self):
+        if self._knob_mode_var.get() == "delta":
+            self._delta_hint.pack(fill=tk.X, pady=(4, 0))
+        else:
+            self._delta_hint.pack_forget()
 
     # ── Parameter area ────────────────────────────────────────────────────────
     def _show_param_for_action(self, act, binding):
@@ -1704,7 +1931,7 @@ class App:
             self._learn_btn.configure(text="Отмена", fg_color=theme.WARN,
                                       hover_color=theme.WARN, text_color="#1a1300")
             self._learn_banner.config(
-                text=f"ПРИВЯЗКА {uid.upper()} — нажмите контрол на устройстве")
+                text=f"ПРИВЯЗКА {self._name(uid)} — нажмите контрол на устройстве")
             self._learn_banner.pack(side=tk.LEFT, padx=10)
             return
         self._learn_banner.pack_forget()
@@ -1741,17 +1968,17 @@ class App:
         if self._learn_uid and self._learn_uid != uid:
             self._learn_uid = None
         self.current_sel = uid
+        self.root.after_idle(self._fit_inspector)
         el = self.ui_elements[uid]
         num = uid.split('_')[1]
 
         # Header text
-        if el["type"] == "pad":
-            name = f"ПЭД {num}"
-        elif el["type"] == "knob":
-            name = f"КРУТИЛКА {num}"
+        if el["type"] == "btn":
+            self._insp_header.config(text="BUTTON")
+            self._insp_header_icon.config(text=el.get("icon", ""))
         else:
-            name = f"КНОПКА  {el.get('icon', num)}"
-        self._insp_header.config(text=name)
+            self._insp_header.config(text=self._name(uid))
+            self._insp_header_icon.config(text="")
 
         # Show content area
         self._insp_hint.pack_forget()
@@ -1782,6 +2009,7 @@ class App:
             self._knob_mode_var.set(mode)
             self._knob_mode_frame.pack(fill=tk.X, pady=(6, 0),
                                        before=self._visible_tab)
+            self._update_mode_hint()
             if mode == "pair":
                 self._pair_frame.pack(fill=tk.X, pady=(6, 0),
                                       before=self._visible_tab)
@@ -2041,7 +2269,7 @@ class App:
                 self._show_volume_osd()
             return
         self._debug_log(f"ОШИБКА {action_id}: {err}")
-        self.last_input_var.set(f"{uid.upper()}: {err}"[:60])
+        self.last_input_var.set(f"{self._name(uid)}: {err}"[:60])
         if uid == self.current_sel:
             self._exec_error_lbl.config(text=err[:40])
 
@@ -2074,7 +2302,7 @@ class App:
         if bank == self._current_bank:
             return
         self._current_bank = bank
-        self._bank_var.set(f"Банк {bank}")
+        self._bank_var.set(self._bank_text())
         # Адрес записи цвета зависит от банка: запись в чужой банк ACK-ается
         # и молча ничего не делает.
         ble.set_bank(bank)
@@ -2129,7 +2357,7 @@ class App:
         label = "CC" if kind == "cc" else "нота"
         self._last_unbound = None
         self._learn_banner.pack_forget()
-        self.last_input_var.set(f"{uid.upper()} ← {label} {midi_id}")
+        self.last_input_var.set(f"{self._name(uid)} ← {label} {midi_id}")
         self._debug_log(f"привязано: {uid} ← {label} {midi_id}")
         if uid == self.current_sel:
             self._update_learn_row()
@@ -2154,7 +2382,26 @@ class App:
         if uid not in self.ui_elements:
             return None
         self._remember_midi_id(uid, cc)
+        # Банк крутилок виден по CC: 30-37 — первый, 38-45 — второй. Сюда
+        # попадают только CC из карты: у крутилки, привязанной вручную к
+        # другому CC, банк не определить — подпись остаётся прежней.
+        knob_bank = 1 if cc <= 37 else 2
+        if knob_bank != self._knob_bank:
+            self._knob_bank = knob_bank
+            self._bank_var.set(self._bank_text())
         return uid
+
+    @staticmethod
+    def _name(uid):
+        """Имя элемента для людей: PAD 6, KNOB 6, BUTTON PLAY.
+        uid в конфиге (pad_6, knob_6, btn_4) при этом не меняются."""
+        kind, _, num = uid.partition("_")
+        if kind == "btn":
+            return "BUTTON " + BTN_WORDS.get(int(num), num) if num.isdigit() else uid
+        return {"pad": "PAD", "knob": "KNOB"}.get(kind, kind.upper()) + " " + num
+
+    def _bank_text(self):
+        return f"Pad bank {self._current_bank} · Knob bank {self._knob_bank}"
 
     def _handle_trigger(self, uid, kind, midi_id, val):
         """Пэд или кнопка: одно нажатие — одно действие."""
@@ -2164,8 +2411,8 @@ class App:
                         f"{'нажатие' if pressed else 'отпускание'}")
         if not pressed:
             return
-        label = f"CC{midi_id}" if kind == "cc" else f"[{midi_id}]"
-        self.last_input_var.set(f"{uid.upper()} {label}")
+        label = f"CC {midi_id}" if kind == "cc" else f"нота {midi_id}"
+        self.last_input_var.set(f"{self._name(uid)} · {label}")
         self.flash_element(uid)
 
         if self._identify_mode:
@@ -2180,7 +2427,7 @@ class App:
         b = appconfig.config["bindings"].get(uid, {})
         action_id = b.get("action", "none")
         if action_id == "none":
-            self.last_input_var.set(f"{uid.upper()} {label} — действие не назначено")
+            self.last_input_var.set(f"{self._name(uid)} · {label} — действие не назначено")
             return
         self._run_action(uid, action_id, b.get("param"))
 
@@ -2192,10 +2439,17 @@ class App:
         разница с предыдущим значением, заворот 0↔127 — через порог ±64.
         Не «улучшать»: три предыдущих декодера были неверны, см. FIXES.md.
         """
-        self.last_input_var.set(f"{uid.upper()} [CC{midi_id}]: {val}")
+        self.last_input_var.set(f"{self._name(uid)} · CC {midi_id} · {val}")
 
         prev = self._prev_knob_cc.get(uid)
-        if prev is not None:
+        if val in RAIL and (prev is None or prev == val):
+            # Упор. Счётчик в контроллере не заворачивается, а упирается в
+            # 0 / 127: если после запуска крутилка стояла, скажем, на 106,
+            # вправо оставался 21 щелчок — громкость «не доходила до 100».
+            # Повтор крайнего значения считаем шагом в ту же сторону.
+            # ГИПОТЕЗА: шлёт ли железо повтор на упоре — не замерено (HANDOFF.md).
+            delta = RAIL[val]
+        elif prev is not None:
             delta = val - prev
             if delta > 64:
                 delta -= 128
@@ -2291,6 +2545,100 @@ class App:
                 self._on_midi("cc", int(parts[1]), int(parts[2]))
 
     # ── Tray ──────────────────────────────────────────────────────────────────
+    # ── Размер и место окна ───────────────────────────────────────────────────
+    START_W, START_H, MIN_W = 1320, 780, 1180
+
+    def _min_height(self):
+        """Минимум по высоте: схема целиком плюс то, чего не хватает инспектору.
+
+        Карточка инспектора не растягивает окно (pack_propagate выключен ради
+        ширины), поэтому её запрос добавляется отдельно.
+        """
+        self.root.update_idletasks()
+        need = self.root.winfo_reqheight()
+        insp = self._inspector_frame
+        short = insp.winfo_reqheight() - insp.winfo_height()
+        if insp.winfo_height() > 1 and short > 0:
+            need = max(need, self.root.winfo_height() + short)
+        return need
+
+    def _place_window(self):
+        """Сохранённое место, если оно на существующем мониторе; иначе по центру
+        рабочей области, не выше 90% её высоты."""
+        min_h = self._min_height()
+        self.root.minsize(self.MIN_W, min_h)
+        saved = winplace.parse(appconfig.config.get("window"))
+        if saved and winplace.on_screen(saved[2], saved[3], saved[0], saved[1]):
+            w, h, x, y = saved
+            self.root.geometry(f"{max(w, self.MIN_W)}x{max(h, min_h)}+{x}+{y}")
+        else:
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            ax, ay, aw, ah = winplace.work_area(0, 0, sw, sh) or (0, 0, sw, sh)
+            w = min(self.START_W, aw)
+            h = max(min(self.START_H, int(ah * 0.9)), min(min_h, ah))
+            x, y = ax + max((aw - w) // 2, 0), ay + max((ah - h) // 2, 0)
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+        self._placed = True
+
+    def _fit_inspector(self):
+        """Если содержимому инспектора не хватает высоты — поднять минимум окна
+        (а с ним и само окно), но не выше рабочей области."""
+        if not self._placed or self.root.state() != "normal":
+            return
+        min_h = self._min_height()
+        cur_h = self.root.winfo_height()
+        area = winplace.work_area(self.root.winfo_rootx(), self.root.winfo_rooty(),
+                                  self.root.winfo_width(), cur_h)
+        if area:
+            min_h = min(min_h, area[3])
+        self.root.minsize(self.MIN_W, min_h)
+        if cur_h < min_h:
+            # Растём вниз, а если низ уходит за рабочую область — сдвигаемся вверх
+            y = self.root.winfo_y()
+            if area:
+                y = max(area[1], min(y, area[1] + area[3] - min_h))
+            self.root.geometry(f"{self.root.winfo_width()}x{min_h}+{self.root.winfo_x()}+{y}")
+
+    def _on_root_configure(self, event):
+        if event.widget is not self.root or not self._placed:
+            return
+        if self._geom_job is not None:
+            self.root.after_cancel(self._geom_job)
+        self._geom_job = self.root.after(600, self._remember_geometry)
+
+    def _remember_geometry(self):
+        """Запомнить размер и место. Только в обычном состоянии: у свёрнутого
+        окна координаты -32000, у спрятанного в трей — мусор."""
+        self._geom_job = None
+        try:
+            if self.root.state() != "normal" or not self.root.winfo_viewable():
+                return
+            g = self.root.geometry()
+        except tk.TclError:
+            return
+        if appconfig.config.get("window") != g:
+            appconfig.config["window"] = g
+            self._save_config()
+
+    def start_in_tray(self):
+        """Запуск с --tray (автозапуск): окно сразу в трее.
+
+        Если значок трея не поднялся, окно показывается: иначе программа
+        висела бы невидимой, и закрыть её было бы нечем (FIXES «tray.py»).
+        Значок pystray появляется асинхронно — через секунду проверяем
+        ещё раз, что он действительно виден.
+        """
+        if not self._tray.available:
+            return
+        self.hide_to_tray()
+
+        def verify():
+            icon = self._tray._icon
+            if icon is None or not getattr(icon, "visible", True):
+                self._debug_log("--tray: значок трея не появился — показываю окно")
+                self.show_from_tray()
+        self.root.after(1500, verify)
+
     def hide_to_tray(self):
         self.root.withdraw()
 
@@ -2410,6 +2758,9 @@ def main():
     root = tk.Tk()
     app = App(root)
     app._show_event = show_event or None
+    import sys as _sys
+    if "--tray" in _sys.argv[1:]:       # автозапуск с Windows
+        app.start_in_tray()
     app.load_hardware_mapping()
     t = threading.Thread(target=ble.start_ble_thread, daemon=True)
     t.start()
