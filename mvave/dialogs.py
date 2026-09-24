@@ -14,7 +14,10 @@ import tkinter as tk
 
 import customtkinter as ctk
 
-from mvave import theme
+from mvave import aa_shapes, theme
+
+# Углы CTk без лесенки: до создания первого виджета. Почему — в aa_shapes.
+aa_shapes.install()
 
 PAD = 20          # внутренний отступ окна; шкала 4/8/12/16/24 — плюс 20 из AGY-sub
 GAP = 8
