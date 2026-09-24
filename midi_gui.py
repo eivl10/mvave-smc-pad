@@ -2222,12 +2222,39 @@ class App:
             self._toggle_debug()
             return "break"
 
+    DEBUG_LOG_MAX = 2_000_000   # байт; больше — старое уходит в .old
+
+    def _debug_log_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(appconfig.CONFIG_FILE)),
+                            "debug.log")
+
     def _toggle_debug(self, event=None):
+        """Ctrl+D: панель журнала + запись журнала в debug.log рядом с настройками.
+
+        Из панели текст не скопировать и её не растянуть — поэтому, пока
+        журнал включён, каждая строка дописывается в файл. Включение сначала
+        сбрасывает в файл то, что уже накопилось в памяти.
+        """
         self._debug_visible = not self._debug_visible
         if self._debug_visible:
             self._debug_frame.pack(fill=tk.X, side=tk.BOTTOM)
+            self._debug_write(["", f"=== журнал включён {time.strftime('%Y-%m-%d %H:%M:%S')} ==="]
+                              + list(self._debug_lines))
+            dialogs.toast(self.root, "Журнал пишется в файл debug.log")
         else:
+            self._debug_write([f"=== журнал выключен {time.strftime('%H:%M:%S')} ==="])
             self._debug_frame.pack_forget()
+
+    def _debug_write(self, lines):
+        """Дописать строки в debug.log. Сбой записи не роняет обработку MIDI."""
+        path = self._debug_log_path()
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > self.DEBUG_LOG_MAX:
+                os.replace(path, path + ".old")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except OSError:
+            pass
 
     def _on_tk_error(self, exc, val, tb):
         """Обработчик исключений Tk. Сам падать не имеет права."""
@@ -2244,6 +2271,7 @@ class App:
         if len(self._debug_lines) > 50:
             self._debug_lines.pop(0)
         if self._debug_visible:
+            self._debug_write([f"{time.strftime('%H:%M:%S')} {msg}"])
             self._debug_text.config(state=tk.NORMAL)
             self._debug_text.delete(1.0, tk.END)
             self._debug_text.insert(tk.END, "\n".join(self._debug_lines[-20:]))

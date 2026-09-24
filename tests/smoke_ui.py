@@ -913,10 +913,18 @@ def ctrl_d_any_layout():
     assert "<Control-Key>" in root.bind() or "<Control-KeyPress>" in root.bind(), root.bind()
     was = app._debug_visible
     root.focus_force(); root.update()
-    # Кириллический keysym Tk синтезировать не умеет — чужая буква, код D
-    root.event_generate("<Control-KeyPress>", keysym="v", keycode=0x44, when="now")
+    # keysym берём не-букву: буквы есть не во всех раскладках, а кириллицу
+    # Tk синтезировать не умеет. Решает код клавиши 0x44 (D)
+    root.event_generate("<Control-KeyPress>", keysym="F5", keycode=0x44, when="now")
     root.update()
     assert app._debug_visible != was, "Ctrl+D в русской раскладке не сработал"
+    if app._debug_visible:
+        app._debug_log("CC 36=127 delta=1 uid=knob_7")
+        path = app._debug_log_path()
+        assert os.path.dirname(path) == os.path.dirname(_tmp), path   # не боевая папка
+        txt = open(path, encoding="utf-8").read()
+        assert "журнал включён" in txt and "CC 36=127 delta=1" in txt, txt[-200:]
+    dialogs._toast_close()
     app._on_ctrl_key(type("E", (), {"keycode": 0x44})())
     assert app._debug_visible == was
     app._on_ctrl_key(type("E", (), {"keycode": 0x43})())   # Ctrl+C — мимо
