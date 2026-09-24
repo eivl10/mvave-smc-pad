@@ -2,6 +2,26 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.0.0] - 2026-09-24
+
+Config and preset format is considered stable from now on: incompatible changes only with a migration / Формат конфига и пресетов с этой версии стабилен: несовместимые изменения — только с миграцией
+
+### Added
+- "Start with Windows" switch in Settings: the app starts hidden in the tray / Переключатель «Запускать вместе с Windows» в настройках: программа стартует спрятанной в трей
+- Desktop shortcut from Settings, works in the exe / Ярлык на рабочем столе из настроек, работает и в exe
+- Lock between knob sides: picking an action on one side sets the opposite on the other / Замок между сторонами крутилки: выбор действия на одной стороне ставит на другую противоположное
+- Help window (the "i" button) / Окно справки (кнопка «i»)
+- Window size and position are remembered / Размер и место окна запоминаются
+
+### Changed
+- Smooth rounded corners and smooth knobs / Гладкие скругления углов и гладкие крутилки
+- Element names in Latin: PAD 6, KNOB 6, BUTTON; back / forward buttons have their own icons / Имена элементов латиницей: PAD 6, KNOB 6, BUTTON; у кнопок «назад / вперёд» свои значки
+- "Identify" is now "Pick by press"; bank indicator is a neutral "Pad bank · Knob bank" caption / «Определить» теперь «Выбор нажатием»; индикатор банка — нейтральная подпись «Pad bank · Knob bank»
+
+### Fixed
+- The bottom of the side panel was cut off in the "Left / right" knob mode / Низ панели справа срезался в режиме крутилки «Влево / вправо»
+- A knob at the controller's end stop keeps moving the value if the controller repeats 0 / 127 (not yet confirmed on hardware, see docs/NEXT.md) / Крутилка на упоре контроллера продолжает менять значение, если он повторяет 0 / 127 (на железе не подтверждено, см. docs/NEXT.md)
+
 ## [0.3.0] - 2026-09-23
 
 ### Added
