@@ -60,7 +60,7 @@ def _monitor_brightness(param, delta):
     """
     global _mon_acc
     from mvave import dimtray
-    _mon_acc += delta * 0.5
+    _mon_acc += delta * 0.75
     step = int(_mon_acc)
     if step == 0:
         return None
