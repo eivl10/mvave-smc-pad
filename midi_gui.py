@@ -742,7 +742,7 @@ class App:
         self._debug_text.pack(fill=tk.X, padx=2, pady=2)
         # Ctrl+D по коду клавиши, а не по символу: в русской раскладке Tk
         # присылает «в» (Cyrillic_ve), и привязка <Control-d> молчала.
-        self.root.bind("<Control-KeyPress>", self._on_ctrl_key)
+        self.root.bind_all("<Control-KeyPress>", self._on_ctrl_key)
 
     def _firmware_button(self, parent, text, tip):
         """Серая кнопка схемы, которую обрабатывает прошивка: не выбирается."""
@@ -2083,7 +2083,11 @@ class App:
             dlg.after(500, lambda: m.close(hotkey_str))
 
         dlg.bind("<KeyPress>", on_key)
-        m.show()
+        self._recording_hotkey = True    # Ctrl+D здесь записывается, а не открывает журнал
+        try:
+            m.show()
+        finally:
+            self._recording_hotkey = False
         return recorded[0] if recorded else None
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -2217,7 +2221,11 @@ class App:
     # ══════════════════════════════════════════════════════════════════════════
     VK_D = 0x44
 
+    _recording_hotkey = False
+
     def _on_ctrl_key(self, event):
+        if self._recording_hotkey:
+            return None
         if getattr(event, "keycode", 0) == self.VK_D:
             self._toggle_debug()
             return "break"

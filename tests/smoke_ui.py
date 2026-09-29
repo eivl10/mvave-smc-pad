@@ -910,7 +910,7 @@ check("переключатель переименован", identify_renamed)
 
 def ctrl_d_any_layout():
     # Русская раскладка: keysym «в», keycode тот же — 0x44 (VK_D)
-    assert "<Control-Key>" in root.bind() or "<Control-KeyPress>" in root.bind(), root.bind()
+    assert "<Control-Key>" in root.bind_all(), root.bind_all()
     was = app._debug_visible
     root.focus_force(); root.update()
     # keysym берём не-букву: буквы есть не во всех раскладках, а кириллицу
@@ -931,6 +931,27 @@ def ctrl_d_any_layout():
     assert app._debug_visible == was
     return "Ctrl+«в» открывает журнал"
 check("Ctrl+D работает в любой раскладке", ctrl_d_any_layout)
+
+def ctrl_d_from_toplevel():
+    # Диалоги и окна настроек — отдельные Toplevel: привязка root их не видит
+    top = tk.Toplevel(root)
+    try:
+        was = app._debug_visible
+        top.update(); top.focus_force(); top.update()
+        top.event_generate("<Control-KeyPress>", keysym="F5", keycode=0x44, when="now")
+        root.update()
+        assert app._debug_visible != was, "Ctrl+D из Toplevel не сработал"
+        app._on_ctrl_key(type("E", (), {"keycode": 0x44})())
+        assert app._debug_visible == was
+        app._recording_hotkey = True
+        app._on_ctrl_key(type("E", (), {"keycode": 0x44})())
+        assert app._debug_visible == was, "Ctrl+D во время записи хоткея открыл журнал"
+    finally:
+        app._recording_hotkey = False
+        top.destroy()
+    dialogs._toast_close()
+    return "из диалога работает, при записи хоткея молчит"
+check("Ctrl+D из отдельного окна", ctrl_d_from_toplevel)
 
 def no_raw_private_use_glyphs():
     # Значки MDL2 в исходниках — только \uXXXX: сами символы частной области
