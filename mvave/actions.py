@@ -17,6 +17,9 @@ except ImportError:
     IAudioEndpointVolume = None
 
 VOL_SENSITIVITY = 0.4
+# Общий множитель щелчка крутилки для ВСЕХ действий вида «delta»: громкость,
+# яркость, цвет, прокрутка — что бы на крутилку ни назначили.
+KNOB_GAIN = 1.5
 keyboard = KeyController()
 mouse = MouseController()
 
@@ -42,10 +45,20 @@ def set_pad_brightness_provider(fn):
     _pad_brightness_cb = fn
 
 
+_pad_acc = 0.0
+
+
 def _pad_brightness(param, delta):
+    """Шаг яркости пэдов целый, а щелчок с множителем дробный — копим остаток."""
+    global _pad_acc
     if _pad_brightness_cb is None:
         return "Яркость пэдов недоступна"
-    _pad_brightness_cb(delta)
+    _pad_acc += delta
+    step = int(_pad_acc)
+    if step == 0:
+        return None
+    _pad_acc -= step
+    _pad_brightness_cb(step)
 
 
 _mon_acc = 0.0
@@ -60,7 +73,7 @@ def _monitor_brightness(param, delta):
     """
     global _mon_acc
     from mvave import dimtray
-    _mon_acc += delta * 0.75
+    _mon_acc += delta * 0.5
     step = int(_mon_acc)
     if step == 0:
         return None
@@ -82,7 +95,7 @@ _KELVIN_STEP = 500
 def _monitor_color(param, delta):
     """Цвет фильтра мониторов (температура) через DimTray: вправо — холоднее."""
     from mvave import dimtray
-    return dimtray.shift_kelvin(int(delta) * _KELVIN_PER_CLICK)
+    return dimtray.shift_kelvin(int(round(delta * _KELVIN_PER_CLICK)))
 
 
 def _monitor_color_step(step):
@@ -480,6 +493,8 @@ def execute(action_id: str, param=None, delta: int = 0) -> Optional[str]:
         return f"Неизвестное действие: {action_id}"
     
     p = action.default_param if param is None else param
+    if action.kind == "delta":
+        delta = delta * KNOB_GAIN
     try:
         err = action.handler(p, delta)
         if err is not None:

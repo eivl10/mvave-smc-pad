@@ -16,6 +16,7 @@ set PYTHONIOENCODING=utf-8
 python tests/smoke_ui.py
 python tests/test_config.py
 python tests/test_protocol.py
+python tests/test_gain.py
 ```
 
 `smoke_ui.py` работает на временной копии конфига и на тестовом ключе реестра. Он же проверяет, что в `.py` нет сырых символов U+E000–U+F8FF: Edit-инструмент пишет значки MDL2 как есть, а в редакторе они невидимы.

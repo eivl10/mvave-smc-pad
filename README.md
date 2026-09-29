@@ -67,7 +67,7 @@ pythonw midi_gui.py
 - `mvave/theme.py` — две палитры (тёмная, светлая), шрифты, стиль списка действий.
 - `mvave/dialogs.py` — свои окна: тост, сообщение, вопрос, ввод, меню, выбор цвета.
 - `mvave/presets.py` — пресеты в папке `presets/`.
-- `tests/` — `smoke_ui.py` (дымовой прогон интерфейса), `test_config.py`, `test_protocol.py`.
+- `tests/` — `smoke_ui.py` (дымовой прогон интерфейса), `test_config.py`, `test_protocol.py`, `test_gain.py`.
 - `tools/` — `build_exe.py` (сборка `release/SMC-PAD.exe`), `make_icon.py`, `probe_color.py`, `smoke_vendor.py`: вспомогательные утилиты, не часть приложения.
 - `docs/PROTOCOL.md` — описание протокола устройства.
 - `midi_config.json` — сохранённые привязки, создаётся приложением. В git не хранится: там личные пути владельца.
