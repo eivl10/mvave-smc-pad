@@ -25,7 +25,7 @@ import tkinter as tk
 import midi_gui
 
 executed = []
-def fake_execute(action_id, param=None, delta=0):
+def fake_execute(action_id, param=None, delta=0, speed=None):
     executed.append((action_id, param, delta))
     return None
 actions.execute = fake_execute
@@ -328,6 +328,32 @@ def pair_survives_reselect():
     assert app._pair_frame.winfo_ismapped(), "после возврата панель сторон пропала"
     return "панель сторон вернулась"
 check("режим пары переживает переключение элемента", pair_survives_reselect)
+
+def knob_speed_slider():
+    app.select_element("knob_3"); root.update()
+    app._knob_mode_var.set("delta"); app._on_knob_mode_change(); root.update()
+    assert app._speed_row.winfo_ismapped(), "ползунок скорости не показан в режиме «Плавно»"
+    assert app._speed_var.get() == actions.KNOB_GAIN     # привязка без speed — как раньше
+    app._speed_var.set(3.0); app._on_speed_change(); root.update()
+    assert appconfig.config["bindings"]["knob_3"]["speed"] == 3.0
+    if app._speed_job is not None:
+        root.after_cancel(app._speed_job); app._speed_job = None
+    app.select_element("knob_2"); root.update()
+    assert app._speed_var.get() == actions.KNOB_GAIN, "скорость протекла на другую крутилку"
+    assert "speed" not in appconfig.config["bindings"].get("knob_2", {})
+    app.select_element("knob_3"); root.update()
+    assert app._speed_var.get() == 3.0, "скорость не вернулась при возврате"
+    appconfig.config["bindings"]["knob_3"]["speed"] = "мусор"
+    app.select_element("knob_2"); app.select_element("knob_3"); root.update()
+    assert app._speed_var.get() == actions.KNOB_GAIN, "мусор в конфиге не починен"
+    app._knob_mode_var.set("pair"); app._on_knob_mode_change(); root.update()
+    assert not app._speed_row.winfo_ismapped(), "ползунок виден в режиме пары"
+    app._knob_mode_var.set("delta"); app._on_knob_mode_change(); root.update()
+    app.select_element("pad_1"); root.update()
+    assert not app._speed_row.winfo_ismapped(), "ползунок виден у пэда"
+    appconfig.config["bindings"]["knob_3"].pop("speed", None)
+    return "ползунок по крутилкам, скрыт в паре и у пэда"
+check("ползунок скорости крутилки", knob_speed_slider)
 
 def tk_errors_go_to_debug():
     before = len(app._debug_lines)

@@ -20,6 +20,22 @@ VOL_SENSITIVITY = 0.4
 # Общий множитель щелчка крутилки для ВСЕХ действий вида «delta»: громкость,
 # яркость, цвет, прокрутка — что бы на крутилку ни назначили.
 KNOB_GAIN = 1.5
+# Скорость одной крутилки (bindings[uid]["speed"]) заменяет KNOB_GAIN для её действия.
+SPEED_MIN = 0.5
+SPEED_MAX = 4.0
+SPEED_STEP = 0.25
+
+
+def clamp_speed(value):
+    """Скорость из конфига → число в диапазоне ползунка; мусор → KNOB_GAIN."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return KNOB_GAIN
+    if v != v:      # NaN
+        return KNOB_GAIN
+    v = max(SPEED_MIN, min(SPEED_MAX, v))
+    return round(v / SPEED_STEP) * SPEED_STEP
 keyboard = KeyController()
 mouse = MouseController()
 
@@ -487,14 +503,14 @@ def opposite(action_id):
 def for_kind(kind: str) -> list[Action]:
     return [a for a in ACTIONS_LIST if a.kind == kind]
 
-def execute(action_id: str, param=None, delta: int = 0) -> Optional[str]:
+def execute(action_id: str, param=None, delta: int = 0, speed=None) -> Optional[str]:
     action = get(action_id)
     if not action:
         return f"Неизвестное действие: {action_id}"
     
     p = action.default_param if param is None else param
     if action.kind == "delta":
-        delta = delta * KNOB_GAIN
+        delta = delta * (KNOB_GAIN if speed is None else clamp_speed(speed))
     try:
         err = action.handler(p, delta)
         if err is not None:

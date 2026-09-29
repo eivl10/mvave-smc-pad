@@ -72,6 +72,24 @@ def test_monitor_color_step_is_int():
     assert sent == [90] and isinstance(sent[0], int), sent
 
 
+def test_speed_overrides_gain():
+    got, restore = _spy("scroll.wheel")
+    try:
+        actions.execute("scroll.wheel", delta=2, speed=3)
+        actions.execute("scroll.wheel", delta=2)
+    finally:
+        restore()
+    assert got == [6.0, 2 * actions.KNOB_GAIN], got
+
+
+def test_clamp_speed():
+    c = actions.clamp_speed
+    assert c(0) == actions.SPEED_MIN and c(99) == actions.SPEED_MAX
+    assert c(1.6) == 1.5 and c(2.9) == 3.0
+    for junk in (None, "abc", float("nan"), [], {}):
+        assert c(junk) == actions.KNOB_GAIN, junk
+
+
 for name, fn in list(globals().items()):
     if name.startswith("test_"):
         check(name, fn)

@@ -1155,6 +1155,23 @@ class App:
                  "«Влево / вправо» — для действий-нажатий.",
             fg=theme.MUTED, bg=S, font=theme.F_TINY, anchor="w", justify=tk.LEFT,
             wraplength=340)
+        # Скорость щелчка: у каждой крутилки своя, хранится в привязке ("speed")
+        self._speed_row = tk.Frame(self._knob_mode_frame, bg=S)
+        self._speed_job = None
+        self._suspend_speed = False
+        self._speed_var = tk.DoubleVar(value=actions.KNOB_GAIN)
+        tk.Label(self._speed_row, text="Скорость", fg=theme.MUTED, bg=S,
+                 font=theme.F_SMALL, anchor="w").pack(side=tk.LEFT, padx=(0, 10))
+        self._speed_scale = ctk.CTkSlider(
+            self._speed_row, from_=actions.SPEED_MIN, to=actions.SPEED_MAX,
+            number_of_steps=int(round((actions.SPEED_MAX - actions.SPEED_MIN) / actions.SPEED_STEP)),
+            variable=self._speed_var, command=self._on_speed_change, width=200, height=16,
+            progress_color=theme.ACCENT, button_color=theme.ACCENT,
+            button_hover_color=theme.ACCENT_HOVER, fg_color=theme.SURFACE_3)
+        self._speed_scale.pack(side=tk.LEFT)
+        self._speed_lbl = tk.Label(self._speed_row, text="", fg=theme.TEXT, bg=S,
+                                   font=theme.F_BOLD, width=5)
+        self._speed_lbl.pack(side=tk.LEFT, padx=(8, 0))
         # Переключатель — только отображение. Источник правды — переменная:
         # её выставляют select_element и тесты, трасса держит кнопку в согласии.
         self._knob_mode_var.trace_add("write", lambda *a: self._knob_mode_seg.set(
@@ -1691,10 +1708,37 @@ class App:
             self._pair_hint.pack_forget()
 
     def _update_mode_hint(self):
+        # Порядок в рамке: переключатель, скорость, подсказка — переупаковываем оба
+        self._speed_row.pack_forget()
+        self._delta_hint.pack_forget()
         if self._knob_mode_var.get() == "delta":
+            self._speed_row.pack(fill=tk.X, pady=(6, 0))
             self._delta_hint.pack(fill=tk.X, pady=(4, 0))
-        else:
-            self._delta_hint.pack_forget()
+
+    def _load_speed(self, b):
+        """Ползунок из привязки выбранной крутилки, без записи обратно."""
+        v = actions.clamp_speed(b.get("speed", actions.KNOB_GAIN))
+        self._suspend_speed = True
+        try:
+            self._speed_var.set(v)
+        finally:
+            self._suspend_speed = False
+        self._speed_lbl.config(text=f"{v:g}×")
+
+    def _on_speed_change(self, val=None):
+        v = actions.clamp_speed(self._speed_var.get())
+        self._speed_lbl.config(text=f"{v:g}×")
+        if self._suspend_speed or not self.current_sel:
+            return
+        appconfig.config["bindings"].setdefault(self.current_sel, {})["speed"] = v
+        # Ползунок шлёт команду на каждое движение — файл пишем после паузы
+        if self._speed_job is not None:
+            self.root.after_cancel(self._speed_job)
+        self._speed_job = self.root.after(300, self._flush_speed)
+
+    def _flush_speed(self):
+        self._speed_job = None
+        self._save_config()
 
     # ── Parameter area ────────────────────────────────────────────────────────
     def _show_param_for_action(self, act, binding):
@@ -1842,7 +1886,7 @@ class App:
         param = b.get("param")
         el = self.ui_elements[self.current_sel]
         delta = 1 if el["type"] == "knob" and b.get("mode") == "delta" else 0
-        err = actions.execute(action_id, param, delta=delta)
+        err = actions.execute(action_id, param, delta=delta, speed=b.get("speed"))
         if err:
             self._exec_error_lbl.config(text=err)
 
@@ -2008,6 +2052,7 @@ class App:
         if el["type"] == "knob":
             mode = b.get("mode", "delta")
             self._knob_mode_var.set(mode)
+            self._load_speed(b)
             self._knob_mode_frame.pack(fill=tk.X, pady=(6, 0),
                                        before=self._visible_tab)
             self._update_mode_hint()
@@ -2305,9 +2350,9 @@ class App:
             self.last_input_var.set("конфиг не сохранён")
             return False
 
-    def _run_action(self, uid, action_id, param=None, delta=0):
+    def _run_action(self, uid, action_id, param=None, delta=0, speed=None):
         """Выполнить действие и показать ошибку, а не проглотить её."""
-        err = actions.execute(action_id, param, delta=delta)
+        err = actions.execute(action_id, param, delta=delta, speed=speed)
         if not err:
             if action_id == "audio.volume":
                 self._show_volume_osd()
@@ -2525,7 +2570,8 @@ class App:
         else:
             action_id = b.get("action", "none")
             if action_id != "none":
-                self._run_action(uid, action_id, b.get("param"), delta=delta)
+                self._run_action(uid, action_id, b.get("param"), delta=delta,
+                                 speed=b.get("speed"))
 
     def _on_midi(self, kind, midi_id, val):
         if self._learn_uid:
