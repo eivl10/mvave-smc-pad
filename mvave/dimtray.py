@@ -75,3 +75,11 @@ def adjust_all(delta: int) -> str | None:
 
 def reset_all() -> str | None:
     return send("reset")
+
+
+def set_kelvin(kelvin: int) -> str | None:
+    return send(f"kelvin {int(kelvin)}")
+
+
+def shift_kelvin(delta: int) -> str | None:
+    return send(f"kshift {int(delta)}")

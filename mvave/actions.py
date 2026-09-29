@@ -75,6 +75,28 @@ def _monitor_step(step):
     return handler
 
 
+_KELVIN_PER_CLICK = 60
+_KELVIN_STEP = 500
+
+
+def _monitor_color(param, delta):
+    """Цвет фильтра мониторов (температура) через DimTray: вправо — холоднее."""
+    from mvave import dimtray
+    return dimtray.shift_kelvin(int(delta) * _KELVIN_PER_CLICK)
+
+
+def _monitor_color_step(step):
+    def handler(param, delta):
+        from mvave import dimtray
+        return dimtray.shift_kelvin(step)
+    return handler
+
+
+def _monitor_color_reset(param, delta):
+    from mvave import dimtray
+    return dimtray.set_kelvin(6500)
+
+
 def _monitor_reset(param, delta):
     from mvave import dimtray
     return dimtray.reset_all()
@@ -410,6 +432,10 @@ ACTIONS_LIST = [
     Action("monitor.brightness", "Яркость мониторов (DimTray)", "Подсветка", "delta", "Ярк экран", "Плавно менять яркость всех мониторов через DimTray", _monitor_brightness),
     Action("monitor.brightness_up", "Яркость мониторов +", "Подсветка", "trigger", "Экран +", "Поднять яркость мониторов на 5% через DimTray", _monitor_step(5)),
     Action("monitor.brightness_down", "Яркость мониторов −", "Подсветка", "trigger", "Экран −", "Опустить яркость мониторов на 5% через DimTray", _monitor_step(-5)),
+    Action("monitor.color", "Цвет фильтра мониторов (DimTray)", "Подсветка", "delta", "Цвет экран", "Плавно менять температуру цвета фильтра всех мониторов через DimTray: вправо — холоднее", _monitor_color),
+    Action("monitor.color_cool", "Цвет мониторов холоднее", "Подсветка", "trigger", "Цвет +", "Поднять температуру цвета мониторов на 500 K через DimTray", _monitor_color_step(_KELVIN_STEP)),
+    Action("monitor.color_warm", "Цвет мониторов теплее", "Подсветка", "trigger", "Цвет −", "Опустить температуру цвета мониторов на 500 K через DimTray", _monitor_color_step(-_KELVIN_STEP)),
+    Action("monitor.color_reset", "Цвет мониторов без оттенка", "Подсветка", "trigger", "Цвет 6500", "Убрать цветной фильтр со всех мониторов", _monitor_color_reset),
     Action("monitor.brightness_reset", "Мониторы на 100%", "Подсветка", "trigger", "Экран 100", "Вернуть все мониторы на полную яркость", _monitor_reset),
 ]
 
